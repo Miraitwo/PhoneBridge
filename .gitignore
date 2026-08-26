@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+.AppleDouble
+
+# Swift Package Manager / Xcode
+.build/
+.build-local/
+.build*/
+.swiftpm/
+.swiftpm-cache/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+
+# Release artifacts and local packaging output
+dist/
+*.dmg
+
+# Logs and temporary files
+*.log
+*.tmp
+*.swp
+*~

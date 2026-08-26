@@ -1,0 +1,30 @@
+PhoneBridge 第三方组件说明
+=========================
+
+PhoneBridge 将以下项目作为独立运行组件或动态库进行分发：
+
+1. UxPlay
+   项目：https://github.com/FDH2/UxPlay
+   许可：GNU General Public License v3.0
+   安装包内附许可文本和本次构建所对应的源代码归档。
+
+2. GStreamer 及其插件
+   项目：https://gstreamer.freedesktop.org/
+   许可：GNU Lesser General Public License v2.1 或各组件注明的兼容许可
+   PhoneBridge 通过动态链接加载这些库，允许使用替换版本进行重新链接。
+
+3. FFmpeg（由 GStreamer libav 插件动态使用）
+   项目：https://ffmpeg.org/
+   许可：本安装包所用 Homebrew 构建为 GNU General Public License v3.0 或更高版本
+   安装包的 Licenses 目录中附有该构建提供的许可说明与 GPLv3 文本。
+
+4. scrcpy
+   项目：https://github.com/Genymobile/scrcpy
+   许可：Apache License 2.0
+   使用 scrcpy 4.1 官方 Apple Silicon 发布包中的 scrcpy、scrcpy-server 和 adb。
+
+5. GLib、gettext、PCRE2、ORC、libjpeg-turbo 等传递依赖
+   这些组件分别遵循其上游项目公布的 LGPL、GPL、BSD 或其他开源许可。
+   安装包的 Licenses 目录中包含可从本机构建依赖取得的许可文本。
+
+PhoneBridge 与 UxPlay、GStreamer、scrcpy 均为独立程序或动态组件；各自的商标和版权归原作者所有。
