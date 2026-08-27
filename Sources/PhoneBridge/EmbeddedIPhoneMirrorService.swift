@@ -33,11 +33,11 @@ enum EmbeddedMirrorState: Equatable {
         case .startingAirPlayReceiver:
             return "正在启动 PhoneBridge AirPlay 接收器…"
         case .startingEmbeddedReceiver:
-            return "正在准备内嵌画面通道…"
+            return "正在准备投屏画面通道…"
         case .waitingForIPhone:
             return "接收器已启动。请在 iPhone 控制中心 → 屏幕镜像中选择界面显示的接收名称。"
         case .running:
-            return "iPhone 画面已直接接入右侧栏，不再打开独立窗口。"
+            return "iPhone 投屏画面已连接。"
         case .failed(let message):
             return message
         }
@@ -117,7 +117,7 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
 
         let portNumber = requestedPort ?? UInt16.random(in: 50_000...59_000)
         guard let port = NWEndpoint.Port(rawValue: portNumber) else {
-            reportFailure("无法创建内嵌画面端口。")
+            reportFailure("无法创建投屏画面端口。")
             return nil
         }
 
@@ -125,7 +125,7 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
         do {
             newListener = try NWListener(using: .tcp, on: port)
         } catch {
-            reportFailure("无法启动内嵌画面通道：\(error.localizedDescription)")
+            reportFailure("无法启动投屏画面通道：\(error.localizedDescription)")
             return nil
         }
 
@@ -156,7 +156,7 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
                     guard self.receiverGeneration == generation,
                           self.listener === newListener else { return }
                     self.releaseReceiverResources()
-                    self.reportFailure("内嵌画面通道已断开：\(error.localizedDescription)")
+                    self.reportFailure("投屏画面通道已断开：\(error.localizedDescription)")
                 }
             default:
                 break

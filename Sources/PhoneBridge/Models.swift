@@ -64,20 +64,6 @@ enum IPhoneMirrorQuality: String, CaseIterable, Identifiable {
     }
 }
 
-enum AndroidMirrorMode: String, CaseIterable, Identifiable {
-    case embedded
-    case separateWindow
-
-    var id: Self { self }
-
-    var label: String {
-        switch self {
-        case .embedded: return "内嵌显示"
-        case .separateWindow: return "独立窗口"
-        }
-    }
-}
-
 enum IPhoneMirrorMode: String, CaseIterable, Identifiable {
     case embedded
     case separateWindow

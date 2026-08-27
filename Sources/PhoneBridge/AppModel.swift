@@ -11,7 +11,6 @@ final class AppModel: ObservableObject {
     private static let iPhonePeerToPeerKey = "PhoneBridge.iPhonePeerToPeer"
     private static let iPhonePeerToPeerPINKey = "PhoneBridge.iPhonePeerToPeerPIN"
     private static let iPhoneMirrorModeKey = "PhoneBridge.iPhoneMirrorMode"
-    private static let androidMirrorModeKey = "PhoneBridge.androidMirrorMode"
     private static let lastMirrorCaptureDirectoryKey = "PhoneBridge.lastMirrorCaptureDirectory"
 
     private struct PendingTransfer {
@@ -50,16 +49,17 @@ final class AppModel: ObservableObject {
     @Published var iPhonePeerToPeerEnabled: Bool
     @Published private(set) var iPhonePeerToPeerPIN: String
     @Published var iPhoneMirrorMode: IPhoneMirrorMode
-    @Published var androidMirrorMode: AndroidMirrorMode
     @Published private(set) var activeMirrorPlatform: PhonePlatform? = nil
 
     let androidService = AndroidADBService()
     let iosService = IOSMediaService()
     let mirroringService = ScreenMirroringService()
     let embeddedIPhoneMirrorService = EmbeddedIPhoneMirrorService()
-    let embeddedAndroidMirrorService = EmbeddedAndroidMirrorService()
     let mirrorCaptureService = MirrorCaptureService()
     let wirelessTransferService = WirelessTransferService()
+    private lazy var iPhoneMirrorWindowService = IPhoneMirrorWindowService(
+        mirrorService: embeddedIPhoneMirrorService
+    )
 
     private var androidDevices: [PhoneDevice] = []
     private var deviceConnectionOrder: [String] = []
@@ -69,10 +69,7 @@ final class AppModel: ObservableObject {
     private var pendingUploads: [PendingUpload] = []
     private var uploadRetryPayloads: [UUID: PendingUpload] = [:]
     private var uploadWorkerIsRunning = false
-    private var embeddedAndroidDeviceID: String?
-    private var embeddedAndroidRestartAttempts = 0
-    private var embeddedAndroidRestartTask: Task<Void, Never>?
-    private var embeddedAndroidStabilityTask: Task<Void, Never>?
+    private var activeAndroidMirrorDeviceID: String?
     private var activeAndroidTextReverse: (deviceID: String, port: Int)?
     private let thumbnailCache = NSCache<NSString, NSData>()
     private var thumbnailLoads: [String: Task<Data?, Never>] = [:]
@@ -102,9 +99,6 @@ final class AppModel: ObservableObject {
         iPhoneMirrorMode = IPhoneMirrorMode(
             rawValue: UserDefaults.standard.string(forKey: Self.iPhoneMirrorModeKey) ?? ""
         ) ?? .embedded
-        androidMirrorMode = AndroidMirrorMode(
-            rawValue: UserDefaults.standard.string(forKey: Self.androidMirrorModeKey) ?? ""
-        ) ?? .embedded
         if let savedPIN = UserDefaults.standard.string(forKey: Self.iPhonePeerToPeerPINKey),
            savedPIN.count == 4,
            savedPIN.allSatisfy(\.isNumber) {
@@ -131,22 +125,18 @@ final class AppModel: ObservableObject {
             self?.errorMessage = message
             self?.statusMessage = message
         }
-        mirroringService.onAndroidStopped = { [weak self] deviceID, mode, stoppedUnexpectedly in
-            guard let self, mode == .embedded, self.embeddedAndroidDeviceID == deviceID else { return }
-            self.embeddedAndroidMirrorService.stop()
-            if stoppedUnexpectedly,
-               self.androidMirrorMode == .embedded,
-               let device = self.devices.first(where: { $0.id == deviceID }) {
-                self.scheduleEmbeddedAndroidRestart(device: device)
-            } else {
-                self.embeddedAndroidDeviceID = nil
-                if self.activeMirrorPlatform == .android { self.activeMirrorPlatform = nil }
-            }
+        mirroringService.onAndroidStopped = { [weak self] deviceID, _ in
+            guard let self, self.activeAndroidMirrorDeviceID == deviceID else { return }
+            self.activeAndroidMirrorDeviceID = nil
+            if self.activeMirrorPlatform == .android { self.activeMirrorPlatform = nil }
+        }
+        mirroringService.onIPhoneStopped = { [weak self] _ in
+            guard let self else { return }
+            self.iPhoneMirrorWindowService.close()
+            self.embeddedIPhoneMirrorService.stop()
+            if self.activeMirrorPlatform == .ios { self.activeMirrorPlatform = nil }
         }
         embeddedIPhoneMirrorService.onStatus = { [weak self] message in
-            self?.statusMessage = message
-        }
-        embeddedAndroidMirrorService.onStatus = { [weak self] message in
             self?.statusMessage = message
         }
         mirrorCaptureService.onStatus = { [weak self] message in
@@ -537,131 +527,25 @@ final class AppModel: ObservableObject {
         }
     }
 
-    func setAndroidMirrorMode(_ mode: AndroidMirrorMode) {
-        guard androidMirrorMode != mode else { return }
-        androidMirrorMode = mode
-        UserDefaults.standard.set(mode.rawValue, forKey: Self.androidMirrorModeKey)
-        if let deviceID = selectedDeviceID,
-           selectedDevice?.platform == .android,
-           mirroringService.androidMirrorMode(deviceID: deviceID) != nil {
-            embeddedAndroidMirrorService.stop()
-            embeddedAndroidRestartTask?.cancel()
-            embeddedAndroidDeviceID = nil
-            mirroringService.stopAndroid(deviceID: deviceID)
-            statusMessage = "已切换为“\(mode.label)”，请重新点击开始投屏。"
-        }
-    }
-
     private func startAndroidMirroring(device: PhoneDevice) {
-        switch androidMirrorMode {
-        case .separateWindow:
-            embeddedAndroidMirrorService.stop()
-            embeddedAndroidDeviceID = nil
-            if mirroringService.androidMirrorMode(deviceID: device.id) == .embedded {
-                mirroringService.stopAndroid(deviceID: device.id)
-                Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 450_000_000)
-                    self?.mirroringService.startAndroid(device: device, mode: .separateWindow)
-                }
-            } else {
-                mirroringService.startAndroid(device: device, mode: .separateWindow)
-            }
-        case .embedded:
-            guard embeddedAndroidMirrorService.hasScreenCapturePermission(requestIfNeeded: true) else {
-                errorMessage = "Android 内嵌投屏需要“屏幕录制”权限。请在系统设置中允许 PhoneBridge，完全退出并重新打开应用后再试。"
-                statusMessage = "等待授予屏幕录制权限。"
-                return
-            }
-            embeddedAndroidRestartAttempts = 0
-            embeddedAndroidRestartTask?.cancel()
-            embeddedAndroidStabilityTask?.cancel()
-            stopIPhoneMirroring()
-            if mirroringService.androidMirrorMode(deviceID: device.id) == .separateWindow {
-                mirroringService.stopAndroid(deviceID: device.id)
-                Task { @MainActor [weak self] in
-                    try? await Task.sleep(nanoseconds: 450_000_000)
-                    self?.launchEmbeddedAndroid(device: device)
-                }
-            } else {
-                launchEmbeddedAndroid(device: device)
-            }
-        }
-    }
-
-    private func launchEmbeddedAndroid(device: PhoneDevice) {
-        guard let launch = mirroringService.startAndroid(device: device, mode: .embedded) else {
-            embeddedAndroidMirrorService.stop()
+        guard mirroringService.startAndroid(device: device) != nil else {
+            if activeMirrorPlatform == .android { activeMirrorPlatform = nil }
             return
         }
-        embeddedAndroidDeviceID = device.id
-        activeMirrorPlatform = .android
-        embeddedAndroidMirrorService.start(
-            processID: launch.processID,
-            windowTitle: launch.windowTitle
-        )
-    }
-
-    private func scheduleEmbeddedAndroidRestart(device: PhoneDevice) {
-        guard embeddedAndroidRestartAttempts < 3 else {
-            embeddedAndroidDeviceID = nil
-            errorMessage = "Android 内嵌投屏连续断开 3 次。请检查数据线/无线 ADB，或暂时切换到独立窗口。"
-            statusMessage = errorMessage ?? "Android 内嵌投屏已停止。"
-            return
-        }
-        embeddedAndroidRestartAttempts += 1
-        let attempt = embeddedAndroidRestartAttempts
-        embeddedAndroidRestartTask?.cancel()
-        statusMessage = "Android 投屏意外断开，正在自动恢复（\(attempt)/3）…"
-        embeddedAndroidRestartTask = Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: UInt64(attempt) * 800_000_000)
-            guard !Task.isCancelled,
-                  let self,
-                  self.androidMirrorMode == .embedded,
-                  self.devices.contains(where: { $0.id == device.id }) else { return }
-            self.launchEmbeddedAndroid(device: device)
-            self.embeddedAndroidStabilityTask?.cancel()
-            self.embeddedAndroidStabilityTask = Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 15_000_000_000)
-                guard !Task.isCancelled,
-                      let self,
-                      self.mirroringService.androidMirrorMode(deviceID: device.id) == .embedded else { return }
-                self.embeddedAndroidRestartAttempts = 0
-            }
-        }
-    }
-
-    func stopEmbeddedAndroidMirroring() {
-        embeddedAndroidRestartTask?.cancel()
-        embeddedAndroidRestartTask = nil
-        embeddedAndroidStabilityTask?.cancel()
-        embeddedAndroidStabilityTask = nil
-        embeddedAndroidRestartAttempts = 0
-        embeddedAndroidMirrorService.stop()
-        if let deviceID = embeddedAndroidDeviceID {
-            mirroringService.stopAndroid(deviceID: deviceID, onlyIf: .embedded)
-        }
-        embeddedAndroidDeviceID = nil
-        if activeMirrorPlatform == .android { activeMirrorPlatform = nil }
+        activeAndroidMirrorDeviceID = device.id
     }
 
     func stopSelectedAndroidMirroring() {
         guard let deviceID = selectedDeviceID, selectedDevice?.platform == .android else { return }
         if mirrorCaptureService.isRecording { stopMirrorRecording() }
-        embeddedAndroidMirrorService.stop()
-        if embeddedAndroidDeviceID == deviceID { embeddedAndroidDeviceID = nil }
-        embeddedAndroidRestartTask?.cancel()
-        embeddedAndroidRestartTask = nil
-        embeddedAndroidStabilityTask?.cancel()
-        embeddedAndroidStabilityTask = nil
-        embeddedAndroidRestartAttempts = 0
         mirroringService.stopAndroid(deviceID: deviceID)
+        if activeAndroidMirrorDeviceID == deviceID { activeAndroidMirrorDeviceID = nil }
         if activeMirrorPlatform == .android { activeMirrorPlatform = nil }
         statusMessage = "正在停止 Android 投屏…"
     }
 
     func stopCurrentEmbeddedMirroring() {
         stopIPhoneMirroring()
-        stopEmbeddedAndroidMirroring()
     }
 
     func openScreenRecordingSettings() {
@@ -689,14 +573,10 @@ final class AppModel: ObservableObject {
     }
 
     private func launchIPhoneAirPlay() {
-        let streamPort: UInt16?
+        embeddedIPhoneMirrorService.markStartingAirPlayReceiver()
+        guard let streamPort = embeddedIPhoneMirrorService.startFrameReceiver() else { return }
         if iPhoneMirrorMode == .embedded {
-            embeddedIPhoneMirrorService.markStartingAirPlayReceiver()
-            streamPort = embeddedIPhoneMirrorService.startFrameReceiver()
-            guard streamPort != nil else { return }
-        } else {
-            embeddedIPhoneMirrorService.stop()
-            streamPort = nil
+            iPhoneMirrorWindowService.close()
         }
         guard mirroringService.startIPhoneAirPlay(
             streamPort: streamPort,
@@ -706,9 +586,23 @@ final class AppModel: ObservableObject {
             peerToPeer: iPhonePeerToPeerEnabled,
             pin: iPhonePeerToPeerEnabled ? iPhonePeerToPeerPIN : nil
         ) != nil else {
+            iPhoneMirrorWindowService.close()
             embeddedIPhoneMirrorService.stop()
             return
         }
+        if iPhoneMirrorMode == .separateWindow {
+            iPhoneMirrorWindowService.show(receiverName: iPhoneAirPlayName)
+        }
+    }
+
+    func showIPhoneMirrorWindow() {
+        guard iPhoneMirrorMode == .separateWindow,
+              mirroringService.iPhoneAirPlayProcessID != nil else {
+            statusMessage = "请先以独立窗口模式启动 AirPlay 接收器。"
+            return
+        }
+        iPhoneMirrorWindowService.show(receiverName: iPhoneAirPlayName)
+        statusMessage = "iPhone 独立投屏窗口已显示。"
     }
 
     func setIPhoneMirrorMode(_ mode: IPhoneMirrorMode) {
@@ -819,6 +713,7 @@ final class AppModel: ObservableObject {
     func stopIPhoneMirroring() {
         if mirrorCaptureService.isRecording { stopMirrorRecording() }
         mirroringService.stopIPhoneAirPlay()
+        iPhoneMirrorWindowService.close()
         embeddedIPhoneMirrorService.stop()
         if activeMirrorPlatform == .ios { activeMirrorPlatform = nil }
     }
@@ -893,32 +788,29 @@ final class AppModel: ObservableObject {
             return
         }
 
-        let panel = NSOpenPanel()
-        panel.title = "选择录屏保存文件夹"
-        panel.message = "录屏完成后将保存到所选文件夹；下次会默认打开此位置。"
-        panel.prompt = "保存到此文件夹"
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
+        let preferredName = mirrorCaptureService.pendingRecordingFilename
+            ?? "PhoneBridge-录屏-\(Self.mirrorCaptureTimestamp()).mp4"
+        let panel = NSSavePanel()
+        panel.title = "命名并保存录屏"
+        panel.message = "可以修改文件名并选择保存位置；下次会默认打开此文件夹。"
+        panel.prompt = "保存"
         panel.canCreateDirectories = true
-        panel.allowsMultipleSelection = false
+        panel.allowedContentTypes = [.mpeg4Movie]
         panel.directoryURL = lastMirrorCaptureDirectory()
-        guard panel.runModal() == .OK, let directory = panel.url else {
-            statusMessage = "已保留本次录屏；点击“保存录像”可再次选择文件夹。"
+        panel.nameFieldStringValue = preferredName
+        guard panel.runModal() == .OK, let destination = panel.url else {
+            statusMessage = "已保留本次录屏；点击“保存录像”可再次命名并选择位置。"
             return
         }
 
-        let preferredName = mirrorCaptureService.pendingRecordingFilename
-            ?? "PhoneBridge-录屏-\(Self.mirrorCaptureTimestamp()).mp4"
-        var reservedPaths = Set<String>()
-        let destination = uniqueDestination(
-            directory: directory,
-            filename: preferredName,
-            reservedPaths: &reservedPaths
-        )
         do {
-            try FileManager.default.moveItem(at: source, to: destination)
+            if FileManager.default.fileExists(atPath: destination.path) {
+                _ = try FileManager.default.replaceItemAt(destination, withItemAt: source)
+            } else {
+                try FileManager.default.moveItem(at: source, to: destination)
+            }
             mirrorCaptureService.markPendingRecordingSaved()
-            rememberMirrorCaptureDirectory(directory)
+            rememberMirrorCaptureDirectory(destination.deletingLastPathComponent())
             statusMessage = "录屏已保存：\(destination.lastPathComponent)"
         } catch {
             show(error)
@@ -928,24 +820,13 @@ final class AppModel: ObservableObject {
     private func currentMirrorCaptureSource() -> MirrorCaptureSource? {
         switch activeMirrorPlatform ?? selectedDevice?.platform {
         case .ios:
-            switch iPhoneMirrorMode {
-            case .embedded:
-                return .embedded { [weak self] in self?.embeddedIPhoneMirrorService.latestFrame }
-            case .separateWindow:
-                guard let processID = mirroringService.iPhoneAirPlayProcessID else { return nil }
-                return .separateWindow(processID: processID)
-            }
+            return .embedded { [weak self] in self?.embeddedIPhoneMirrorService.latestFrame }
 
         case .android:
-            let deviceID = embeddedAndroidDeviceID ?? selectedDeviceID
+            let deviceID = activeAndroidMirrorDeviceID ?? selectedDeviceID
             guard let deviceID else { return nil }
-            switch androidMirrorMode {
-            case .embedded:
-                return .embedded { [weak self] in self?.embeddedAndroidMirrorService.latestFrame }
-            case .separateWindow:
-                guard let processID = mirroringService.androidMirrorProcessID(deviceID: deviceID) else { return nil }
-                return .separateWindow(processID: processID)
-            }
+            guard let processID = mirroringService.androidMirrorProcessID(deviceID: deviceID) else { return nil }
+            return .separateWindow(processID: processID)
 
         case nil:
             return nil

@@ -1,6 +1,6 @@
 # PhoneBridge 技术方案与实现说明
 
-> 适用版本：PhoneBridge 0.14.0（Build 24）
+> 适用版本：PhoneBridge 0.14.1（Build 25）
 > 文档定位：架构设计、关键实现、构建发布、验证现状和后续演进
 > 目标平台：Apple Silicon macOS 13+
 
@@ -33,7 +33,7 @@ PhoneBridge 希望在一个 macOS 原生界面中打通以下能力：
 - 多台手机的独立文件面板与顺序调整。
 - iPhone AirPlay 内嵌/独立窗口双模式及三档画质，无 USB 设备发现也可启动接收器。
 - AirPlay 接收名称自定义、持久化与运行中热切换。
-- Android scrcpy 内嵌只查看 / 独立可控制双模式投屏。
+- Android scrcpy 独立可控制窗口投屏。
 - 本地 HTTP 无线上传、文件下载和证书二维码。
 - Apple Silicon 自包含 DMG。
 
@@ -41,7 +41,7 @@ PhoneBridge 希望在一个 macOS 原生界面中打通以下能力：
 
 - 完整 iOS 文件系统管理。
 - 通过 iOS USB 照片接口写入任意文件。
-- Android 内嵌投屏中的键鼠反向控制。
+- Android 投屏内嵌到 PhoneBridge 主窗口。
 - 同时内嵌多路 iPhone 投屏。
 - iPhone 投屏音频。
 - 云端中转、跨公网传输或账号系统。
@@ -120,8 +120,6 @@ flowchart LR
 | `AndroidADBService.swift` | ADB 发现、目录解析、pull、push、pair/connect/disconnect |
 | `IOSMediaService.swift` | ImageCaptureCore 设备发现、媒体目录、缩略图和下载 |
 | `ScreenMirroringService.swift` | scrcpy 和 UxPlay 子进程管理、运行环境和错误收集 |
-| `EmbeddedAndroidMirrorService.swift` | 定位 scrcpy 进程的唯一窗口，通过 ScreenCaptureKit 读取画面并统计 fps |
-| `EmbeddedAndroidMirrorView.swift` | Android 内嵌画面、等待/失败状态的 SwiftUI 展示 |
 | `EmbeddedIPhoneMirrorService.swift` | 本地 TCP 监听、JPEG 流切帧、图像解码、fps 统计 |
 | `EmbeddedIPhoneMirrorView.swift` | iPhone 内嵌画面的 SwiftUI 展示 |
 | `WirelessTransferService.swift` | 本地 HTTP 服务、随机令牌、上传、下载和文件落盘 |
@@ -600,12 +598,7 @@ PhoneBridge 只负责分发，不会绕过 iOS 的描述文件安装和证书完
 
 ## 15. Android 投屏方案
 
-每台 Android 使用独立 `Process`，并支持两种 `AndroidMirrorMode`：
-
-- `embedded`：最右侧内嵌只查看。
-- `separateWindow`：scrcpy 独立可控制窗口。
-
-独立模式执行：
+每台 Android 使用独立 `Process` 启动一个 scrcpy 原生可控制窗口，执行：
 
 ```bash
 scrcpy \
@@ -619,11 +612,9 @@ scrcpy \
 - 同一设备只启动一个窗口。
 - 多台 Android 可各自运行窗口。
 - USB 和无线 ADB 使用相同设备 ID 路由。
-- 切换显示模式时先停止当前 scrcpy，由用户重新开始目标模式。
+- PhoneBridge 只启动 scrcpy 原生独立窗口，不再建立 Android 内嵌采集通道。
 
-内嵌模式为 scrcpy 设置唯一窗口标题和 360×640 初始尺寸。`EmbeddedAndroidMirrorService` 通过 `SCShareableContent` 按 PID 和标题定位 `SCWindow`，用 `SCContentFilter(desktopIndependentWindow:)` 建立 30fps 捕获，再把 BGRA 像素帧转为 `CGImage` 交给 SwiftUI。首帧超时或 `SCStream` 中断时最多自动重建 5 次画面通道；scrcpy 进程异常退出时，`AppModel` 最多自动重启 3 次，并在稳定运行 15 秒后清零计数。
-
-这一嵌入方式不向 scrcpy 反向注入键鼠事件，因此内嵌是只查看模式。需要控制、剪贴板和拖放时使用独立窗口。
+独立窗口由 scrcpy 直接解码和渲染，保留最低延迟、键鼠控制、剪贴板与拖放能力。PhoneBridge 右侧投屏栏仅承担启动、停止、截屏和录屏控制，不复制显示 Android 画面。
 
 ## 16. iPhone 投屏方案
 
@@ -653,7 +644,9 @@ sequenceDiagram
     R-->>V: latestFrame, resolution, fps
 ```
 
-独立窗口模式跳过本地 TCP/JPEG 接收器，并显式传入 `-vs avsamplebufferlayersink`。安装包中的 macOS AVSampleBuffer 视频输出组件注册优先级为 `none`，默认 `autovideosink` 无法稳定自动选择；显式指定后由 UxPlay/GStreamer 创建渲染窗口，并在检测到视频流启动日志后将窗口带到前台。内嵌模式继续使用上图链路。
+内嵌与独立窗口模式复用同一条本地 TCP/JPEG 接收链路。内嵌模式由右侧 `EmbeddedIPhoneMirrorView` 显示；独立模式由 `IPhoneMirrorWindowService` 创建可缩放的原生 `NSWindow`，并在窗口内复用相同的 SwiftUI 画面组件。窗口位置和尺寸由 AppKit 自动记忆，手动关闭后可以从侧栏重新打开。
+
+0.14.0 曾在独立模式显式使用 `avsamplebufferlayersink`。真实 AirPlay 画面到达后，macOS 26.5.2 上的 `libgstapplemedia.dylib` 会在 `AVMediaDataRequester` 回调中访问无效的 GLib 互斥锁并触发 `SIGSEGV 11`。0.14.1 移除了这条不稳定输出路径，UxPlay 只负责接收、解码和 JPEG 输出，窗口生命周期完全由 PhoneBridge 管理。
 
 ### 16.2 UxPlay 参数
 
@@ -740,14 +733,14 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 
 ### 16.8 投屏截屏与录屏
 
-`MirrorCaptureService` 将四种投屏组合统一为 `MirrorCaptureSource`：
+`MirrorCaptureService` 将投屏来源统一为 `MirrorCaptureSource`：
 
-- iPhone / Android 内嵌模式直接读取对应服务的最新 `CGImage`，避免重复采集。
-- iPhone / Android 独立窗口根据 UxPlay 或 scrcpy 的进程 ID，通过 `SCShareableContent` 找到面积最大的投屏窗口，再用 `SCStream` 持续接收窗口帧。
+- iPhone 内嵌与独立窗口直接读取投屏服务的最新 `CGImage`，避免重复采集。
+- Android 独立窗口根据 scrcpy 进程 ID，通过 `SCShareableContent` 找到面积最大的投屏窗口，再用 `SCStream` 持续接收窗口帧。
 
 截屏使用 `NSBitmapImageRep` 输出 PNG。录屏使用 `AVAssetWriter`、`AVAssetWriterInputPixelBufferAdaptor` 和 H.264 编码；按原始宽高比缩放到最长边不超过 1920 像素的偶数尺寸，空余区域使用黑色填充，时间戳采用实际录制时长而非固定帧序号。
 
-录制先写入系统临时目录，结束并成功封装 MP4 后再弹出文件夹选择器。用户取消选择时保留临时文件，并在工具栏显示“保存录像”；成功移动到目标目录后才清除待保存状态。独立窗口采集需要 macOS 屏幕录制权限，内嵌帧保存不额外申请权限。
+录制先写入系统临时目录，结束并成功封装 MP4 后再弹出 `NSSavePanel`。默认名称包含录制结束时间，用户可修改文件名和保存目录；取消时保留临时文件，并在工具栏显示“保存录像”，成功移动或替换目标文件后才清除待保存状态。保存面板的初始目录由 `PhoneBridge.lastMirrorCaptureDirectory` 恢复。只有需要抓取 scrcpy 窗口的 Android 独立模式依赖 macOS 屏幕录制权限，直接读取投屏帧的模式不额外申请权限。
 
 ## 17. 配置持久化
 
@@ -761,7 +754,6 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 | `PhoneBridge.iPhonePeerToPeer` | 是否启用附近设备模式 |
 | `PhoneBridge.iPhonePeerToPeerPIN` | 4 位附近投屏 PIN |
 | `PhoneBridge.iPhoneMirrorMode` | iPhone 投屏的内嵌 / 独立窗口偏好 |
-| `PhoneBridge.androidMirrorMode` | Android 投屏的内嵌 / 独立窗口偏好 |
 | `PhoneBridge.lastMirrorCaptureDirectory` | 上次投屏截图或录像的保存文件夹 |
 
 设备面板顺序、搜索、筛选、排序和勾选状态当前不跨应用重启保存。
@@ -857,7 +849,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 生成：
 
 ```text
-dist/PhoneBridge-0.14.0-AppleSilicon.dmg
+dist/PhoneBridge-0.14.1-AppleSilicon.dmg
 ```
 
 DMG 包含：
@@ -914,10 +906,10 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 
 ### 22.1 已完成验证
 
-- PhoneBridge 0.14.0 Release 编译通过，无 Swift 编译警告。
+- PhoneBridge 0.14.1 Release 编译通过，无 Swift 编译警告。
 - 主程序为 arm64 Mach-O。
 - DMG 创建、CRC 校验和只读挂载通过。
-- DMG 内 App 版本为 0.14.0，Build 24。
+- DMG 内 App 版本为 0.14.1，Build 25。
 - DMG 内 App 深度签名校验通过。
 - UxPlay、GStreamer、scrcpy、ADB 已封装。
 - UxPlay 启动检查所需的 `libav`、`autodetect` 插件及递归动态库已封装；使用包内运行环境启动后未再立即以插件缺失退出。
@@ -936,6 +928,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 - Mac 路径面包屑已通过实际 UI 点击验证，可从深层目录直接跳到上层。
 - 打包内 UxPlay 已在没有 USB iPhone 的情况下使用 `-p2p -pin` 启动，并输出 `Initialized server socket(s)`；实际 iPhone 发现仍需做机型/现场无线覆盖。
 - 合成 720×1280 画面录屏验证通过：生成 H.264 MP4，视频尺寸、时长和首帧均可正常解析。
+- 两份真实 UxPlay 崩溃报告均确认旧 `avsamplebufferlayersink` 在 `libgstapplemedia` 内以 `SIGSEGV 11` 退出；0.14.1 已移除该组件并改用 PhoneBridge 原生独立窗口。
 
 ### 22.2 仍需实机覆盖
 
@@ -950,7 +943,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 - 大文件、断网、休眠、锁屏和磁盘空间不足场景。
 - 使用真实鼠标连续快速跨行拖入左侧各区域的回归测试，以及同名 Finder 项目粘贴的完整 UI 回归。
 - iPhone 文本二维码在不同 Safari/iOS 版本中的复制、分享至备忘录和链接打开行为。
-- Android 指定目录 push、Mac→Android 面板拖拽、Android 内嵌连续断开恢复需要在设备重新连接后补充实测。
+- Android 指定目录 push、Mac→Android 面板拖拽与独立窗口投屏需要在不同设备上补充回归。
 - iPhone 内嵌/独立窗口切换、无 USB 的普通 Bonjour 与 AWDL 实际发现需要补充真机回归。
 
 ## 23. 风险与限制
@@ -980,7 +973,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 - 评估 H.264/HEVC 直解码，减少 JPEG 重编码。
 - 使用 VideoToolbox、CVPixelBuffer 或 IOSurface 降低复制。
 - 增加帧延迟、丢帧率、CPU 和内存监控。
-- 优化 Android 内嵌自动恢复的退避、诊断日志和长期稳定性指标。
+- 增加 Android scrcpy 独立窗口异常退出诊断和自动恢复能力。
 
 ### P1：文件能力
 

@@ -4,23 +4,21 @@ import Foundation
 struct AndroidMirrorLaunch {
     let processID: pid_t
     let windowTitle: String
-    let mode: AndroidMirrorMode
 }
 
 @MainActor
 final class ScreenMirroringService {
     var onStatus: ((String) -> Void)?
     var onError: ((String) -> Void)?
-    var onAndroidStopped: ((String, AndroidMirrorMode, Bool) -> Void)?
+    var onAndroidStopped: ((String, Bool) -> Void)?
+    var onIPhoneStopped: ((Bool) -> Void)?
 
     private var scrcpyProcesses: [String: Process] = [:]
-    private var scrcpyModes: [String: AndroidMirrorMode] = [:]
     private var stoppingAndroidDeviceIDs = Set<String>()
     private var uxPlayProcess: Process?
     private var uxPlayOutputPipe: Pipe?
     private var uxPlayLogTail: [String] = []
     private var isStoppingUxPlay = false
-    private var hasActivatedIPhoneWindow = false
     private var iPhoneAirPlayReceiverName = "PhoneBridge"
     private(set) var iPhoneAirPlayMode: IPhoneMirrorMode?
 
@@ -30,14 +28,11 @@ final class ScreenMirroringService {
     }
 
     @discardableResult
-    func startAndroid(device: PhoneDevice, mode: AndroidMirrorMode = .separateWindow) -> AndroidMirrorLaunch? {
-        if let existing = scrcpyProcesses[device.id], existing.isRunning,
-           scrcpyModes[device.id] == mode {
-            let title = androidWindowTitle(device: device, mode: mode)
-            onStatus?(mode == .embedded
-                ? "\(device.name) 的内嵌投屏已经启动。"
-                : "\(device.name) 的 scrcpy 独立窗口已经打开。")
-            return AndroidMirrorLaunch(processID: existing.processIdentifier, windowTitle: title, mode: mode)
+    func startAndroid(device: PhoneDevice) -> AndroidMirrorLaunch? {
+        if let existing = scrcpyProcesses[device.id], existing.isRunning {
+            let title = androidWindowTitle(device: device)
+            onStatus?("\(device.name) 的 scrcpy 独立窗口已经打开。")
+            return AndroidMirrorLaunch(processID: existing.processIdentifier, windowTitle: title)
         }
         if scrcpyProcesses[device.id]?.isRunning == true {
             stopAndroid(deviceID: device.id)
@@ -50,23 +45,12 @@ final class ScreenMirroringService {
 
         let process = Process()
         process.executableURL = executable
-        let windowTitle = androidWindowTitle(device: device, mode: mode)
-        var arguments = [
+        let windowTitle = androidWindowTitle(device: device)
+        let arguments = [
             "--serial", device.id,
             "--window-title", windowTitle,
             "--stay-awake"
         ]
-        if mode == .embedded {
-            arguments.append(contentsOf: [
-                "--no-audio",
-                "--window-borderless",
-                "--window-x", "0",
-                "--window-y", "0",
-                "--window-width", "360",
-                "--window-height", "640",
-                "--max-size", "1920"
-            ])
-        }
         process.arguments = arguments
         var environment = ProcessInfo.processInfo.environment
         configureBundledRuntimeEnvironment(&environment)
@@ -80,9 +64,8 @@ final class ScreenMirroringService {
                 guard let self else { return }
                 guard self.scrcpyProcesses[device.id] === finishedProcess else { return }
                 self.scrcpyProcesses.removeValue(forKey: device.id)
-                let finishedMode = self.scrcpyModes.removeValue(forKey: device.id) ?? mode
                 let wasStoppedByApp = self.stoppingAndroidDeviceIDs.remove(device.id) != nil
-                self.onAndroidStopped?(device.id, finishedMode, !wasStoppedByApp)
+                self.onAndroidStopped?(device.id, !wasStoppedByApp)
                 if !wasStoppedByApp, finishedProcess.terminationStatus != 0 {
                     self.onError?("scrcpy 投屏已结束（退出码 \(finishedProcess.terminationStatus)）。请确认 USB 调试已授权。")
                 } else if !wasStoppedByApp {
@@ -94,14 +77,10 @@ final class ScreenMirroringService {
         do {
             try process.run()
             scrcpyProcesses[device.id] = process
-            scrcpyModes[device.id] = mode
-            onStatus?(mode == .embedded
-                ? "正在把 \(device.name) 的 scrcpy 画面接入侧栏…"
-                : "正在启动 \(device.name) 的 scrcpy 独立窗口…")
+            onStatus?("正在启动 \(device.name) 的 scrcpy 独立窗口…")
             return AndroidMirrorLaunch(
                 processID: process.processIdentifier,
-                windowTitle: windowTitle,
-                mode: mode
+                windowTitle: windowTitle
             )
         } catch {
             onError?("无法启动 scrcpy：\(error.localizedDescription)")
@@ -109,20 +88,13 @@ final class ScreenMirroringService {
         }
     }
 
-    func stopAndroid(deviceID: String, onlyIf mode: AndroidMirrorMode? = nil) {
+    func stopAndroid(deviceID: String) {
         guard let process = scrcpyProcesses[deviceID], process.isRunning else {
             scrcpyProcesses.removeValue(forKey: deviceID)
-            scrcpyModes.removeValue(forKey: deviceID)
             return
         }
-        if let mode, scrcpyModes[deviceID] != mode { return }
         stoppingAndroidDeviceIDs.insert(deviceID)
         process.interrupt()
-    }
-
-    func androidMirrorMode(deviceID: String) -> AndroidMirrorMode? {
-        guard scrcpyProcesses[deviceID]?.isRunning == true else { return nil }
-        return scrcpyModes[deviceID]
     }
 
     func androidMirrorProcessID(deviceID: String) -> pid_t? {
@@ -130,11 +102,8 @@ final class ScreenMirroringService {
         return process.processIdentifier
     }
 
-    private func androidWindowTitle(device: PhoneDevice, mode: AndroidMirrorMode) -> String {
-        switch mode {
-        case .embedded: return "PhoneBridge Embedded · \(device.id)"
-        case .separateWindow: return "PhoneBridge · \(device.name)"
-        }
+    private func androidWindowTitle(device: PhoneDevice) -> String {
+        "PhoneBridge · \(device.name)"
     }
 
     @discardableResult
@@ -151,8 +120,8 @@ final class ScreenMirroringService {
             return processID
         }
 
-        if mode == .embedded, streamPort == nil {
-            onError?("内嵌投屏通道尚未准备好，请重新启动投屏。")
+        if streamPort == nil {
+            onError?("投屏画面通道尚未准备好，请重新启动投屏。")
             return nil
         }
 
@@ -177,16 +146,14 @@ final class ScreenMirroringService {
             "-s", quality.requestedResolution,
             "-fps", String(quality.maximumFrameRate)
         ]
-        if let streamPort, mode == .embedded {
+        if let streamPort {
+            // Both display modes use the stable JPEG/TCP path. PhoneBridge
+            // renders separate mode in its own native NSWindow; this avoids
+            // avsamplebufferlayersink, which crashes inside libgstapplemedia
+            // while processing real AirPlay frames on macOS 26.
             arguments.append(contentsOf: [
                 "-vs", "jpegenc quality=\(quality.jpegQuality) ! tcpclientsink host=127.0.0.1 port=\(streamPort)"
             ])
-        } else if mode == .separateWindow {
-            // The macOS AVSampleBuffer sink is intentionally registered with
-            // rank "none", so UxPlay's default autovideosink cannot discover
-            // it reliably in the self-contained app runtime. Select it
-            // explicitly so an AirPlay connection always creates a window.
-            arguments.append(contentsOf: ["-vs", "avsamplebufferlayersink"])
         }
         if peerToPeer {
             arguments.append("-p2p")
@@ -205,7 +172,6 @@ final class ScreenMirroringService {
 
         uxPlayLogTail = []
         isStoppingUxPlay = false
-        hasActivatedIPhoneWindow = false
         outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let message = String(data: data, encoding: .utf8) else { return }
@@ -223,7 +189,7 @@ final class ScreenMirroringService {
                 self.uxPlayProcess = nil
                 self.iPhoneAirPlayMode = nil
                 self.isStoppingUxPlay = false
-                self.hasActivatedIPhoneWindow = false
+                self.onIPhoneStopped?(!wasStoppedByUser && finishedProcess.terminationStatus != 0)
 
                 if wasStoppedByUser || finishedProcess.terminationStatus == 0 {
                     self.onStatus?("AirPlay 投屏已停止。")
@@ -262,7 +228,6 @@ final class ScreenMirroringService {
         uxPlayOutputPipe = nil
         uxPlayProcess = nil
         iPhoneAirPlayMode = nil
-        hasActivatedIPhoneWindow = false
         process.interrupt()
         onStatus?("正在停止 AirPlay 投屏…")
     }
@@ -281,30 +246,8 @@ final class ScreenMirroringService {
         if lines.contains(where: { $0.contains("Initialized server socket") }) {
             onStatus?("AirPlay 接收器已启动。请在 iPhone 控制中心 → 屏幕镜像中选择“\(iPhoneAirPlayReceiverName)”。")
         }
-        if iPhoneAirPlayMode == .separateWindow,
-           !hasActivatedIPhoneWindow,
-           lines.contains(where: {
-               $0.contains("Begin streaming to GStreamer video pipeline")
-                   || $0.contains("raop_rtp_mirror starting mirroring")
-                   || $0.contains("Initialized GStreamer video renderer")
-           }) {
-            hasActivatedIPhoneWindow = true
-            activateIPhoneMirrorWindow()
-        }
         if lines.contains(where: { $0.contains("SO_RECV_ANYIF") && $0.localizedCaseInsensitiveContains("failed") }) {
             onError?("附近设备 AirPlay 启动失败。请确认 Mac 的 Wi-Fi、蓝牙和本地网络权限已开启，再重新启动接收器。")
-        }
-    }
-
-    private func activateIPhoneMirrorWindow() {
-        guard let processID = iPhoneAirPlayProcessID else { return }
-        Task { @MainActor [weak self] in
-            try? await Task.sleep(nanoseconds: 450_000_000)
-            guard self?.iPhoneAirPlayProcessID == processID else { return }
-            if let application = NSRunningApplication(processIdentifier: processID) {
-                application.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
-            }
-            self?.onStatus?("iPhone 独立投屏窗口已打开。")
         }
     }
 

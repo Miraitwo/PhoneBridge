@@ -567,10 +567,17 @@ struct ContentView: View {
                             .foregroundStyle(.secondary)
                         Text("iPhone 独立投屏窗口")
                             .font(.headline)
-                        Text("启动后，iPhone 画面由 UxPlay 在单独窗口中显示；关闭侧栏不会遮挡文件面板。")
+                        Text("启动后，PhoneBridge 会在原生独立窗口中显示 iPhone 画面；关闭侧栏不会遮挡文件面板。")
                             .multilineTextAlignment(.center)
                             .foregroundStyle(.secondary)
                             .frame(maxWidth: 360)
+                        Button {
+                            model.showIPhoneMirrorWindow()
+                        } label: {
+                            Label("显示独立窗口", systemImage: "macwindow")
+                        }
+                        .buttonStyle(.bordered)
+                        .disabled(model.mirroringService.iPhoneAirPlayProcessID == nil)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(24)
@@ -680,93 +687,31 @@ struct ContentView: View {
                 }
 
             case .android:
-                VStack(spacing: 10) {
-                    Picker("显示方式", selection: Binding(
-                        get: { model.androidMirrorMode },
-                        set: { model.setAndroidMirrorMode($0) }
-                    )) {
-                        ForEach(AndroidMirrorMode.allCases) { mode in
-                            Text(mode.label).tag(mode)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .padding(.horizontal, 12)
-                    .padding(.top, 10)
-
-                    if model.androidMirrorMode == .embedded {
-                        EmbeddedAndroidMirrorView(service: model.embeddedAndroidMirrorService)
-                            .frame(maxWidth: .infinity, maxHeight: .infinity)
-                            .padding(model.embeddedAndroidMirrorService.state.isCapturing ? 2 : 10)
-
-                        HStack(spacing: 8) {
-                            if let size = model.embeddedAndroidMirrorService.framePixelSize {
-                                Text("\(Int(size.width))×\(Int(size.height))")
-                            }
-                            if model.embeddedAndroidMirrorService.framesPerSecond > 0 {
-                                Text(String(format: "%.1f fps", model.embeddedAndroidMirrorService.framesPerSecond))
-                            }
-                            Spacer()
-                            Text("内嵌模式仅查看画面")
-                        }
-                        .font(.caption)
+                VStack(spacing: 14) {
+                    Image(systemName: "rectangle.on.rectangle")
+                        .font(.system(size: 44, weight: .light))
                         .foregroundStyle(.secondary)
-                        .padding(.horizontal, 12)
-
-                        HStack(spacing: 8) {
-                            Button {
-                                model.startUSBScreenMirroring()
-                            } label: {
-                                Label(
-                                    model.embeddedAndroidMirrorService.state.isActive ? "重新接入" : "开始内嵌投屏",
-                                    systemImage: "play.rectangle"
-                                )
-                            }
-                            .buttonStyle(.borderedProminent)
-
-                            Button("停止") {
-                                model.stopSelectedAndroidMirroring()
-                            }
-                            .buttonStyle(.bordered)
-                            .disabled(!model.embeddedAndroidMirrorService.state.isActive)
-
-                            Button("权限设置") {
-                                model.openScreenRecordingSettings()
-                            }
-                            .buttonStyle(.bordered)
+                    Text("scrcpy 独立窗口")
+                        .font(.headline)
+                    Text("Android 投屏固定使用独立窗口，保留最低延迟、键鼠控制、剪贴板和拖放能力；USB 调试与无线 ADB 均可使用。")
+                        .multilineTextAlignment(.center)
+                        .foregroundStyle(.secondary)
+                        .frame(maxWidth: 360)
+                    HStack {
+                        Button {
+                            model.startUSBScreenMirroring()
+                        } label: {
+                            Label("打开独立窗口", systemImage: "macwindow")
                         }
-                        .controlSize(.small)
-                        .padding(.horizontal, 12)
-                        .padding(.bottom, 10)
-                    } else {
-                        VStack(spacing: 14) {
-                            Image(systemName: "rectangle.on.rectangle")
-                                .font(.system(size: 44, weight: .light))
-                                .foregroundStyle(.secondary)
-                            Text("scrcpy 独立窗口")
-                                .font(.headline)
-                            Text("独立窗口保留最低延迟、键鼠控制、剪贴板和拖放能力；USB 调试与无线 ADB 均可使用。")
-                                .multilineTextAlignment(.center)
-                                .foregroundStyle(.secondary)
-                                .frame(maxWidth: 360)
-                            HStack {
-                                Button {
-                                    model.startUSBScreenMirroring()
-                                } label: {
-                                    Label("打开独立窗口", systemImage: "macwindow")
-                                }
-                                .buttonStyle(.borderedProminent)
-                                Button("停止") {
-                                    model.stopSelectedAndroidMirroring()
-                                }
-                                .buttonStyle(.bordered)
-                            }
+                        .buttonStyle(.borderedProminent)
+                        Button("停止") {
+                            model.stopSelectedAndroidMirroring()
                         }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .padding(24)
+                        .buttonStyle(.bordered)
                     }
                 }
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
+                .padding(24)
 
             case nil:
                 EmptyStateView(
@@ -1317,7 +1262,7 @@ private struct MirrorCaptureToolbar: View {
 
             if service.isRecording {
                 Button(action: onStopRecording) {
-                    Label("停止并保存", systemImage: "stop.circle.fill")
+                    Label("停止并命名保存", systemImage: "stop.circle.fill")
                 }
                 .buttonStyle(.borderedProminent)
                 .tint(.red)

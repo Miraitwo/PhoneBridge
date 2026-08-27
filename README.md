@@ -5,6 +5,8 @@
 
 PhoneBridge 是一款个人使用的 macOS 手机文件传输与投屏工具。主界面左侧为 Mac 文件区，右侧可按连接顺序展开多个手机文件面板；投屏区默认隐藏，点击设备面板中的“投屏”后才会从最右侧展开。手机文件可以拖到 Mac，Mac 文件也可以直接拖到 Android 或 iPhone 面板。
 
+版本变化见 [CHANGELOG.md](CHANGELOG.md)。
+
 ## 当前 MVP 能力
 
 - 原生 SwiftUI 多面板界面：Mac 文件、多个手机文件面板和按需展开的独立投屏侧栏。
@@ -35,9 +37,9 @@ PhoneBridge 是一款个人使用的 macOS 手机文件传输与投屏工具。�
 - Android 11 及以上支持在界面中执行无线 ADB 配对、连接和断开；无线文件浏览、传输及 scrcpy 投屏复用已有能力。
 - iPhone 投屏支持“清晰优先 / 流畅优先 / 节省带宽”三档画质，并显示实际分辨率和帧率；还可启用带 PIN 的附近设备模式。
 - iPhone AirPlay 接收名称可在“无线连接”中自定义并持久保存，支持中文；多人同时使用时可加入姓名、工位或设备编号，避免在“屏幕镜像”列表中混淆。
-- 最右侧投屏栏默认隐藏，不再长期占用手机文件区；iPhone 与 Android 都可选“内嵌显示 / 独立窗口”。iPhone 无需登录 Apple ID，也不需要先插数据线即可从“无线连接”启动 AirPlay 接收器。
-- Android 内嵌模式用 ScreenCaptureKit 捕获 scrcpy 指定窗口，并在画面通道中断或 scrcpy 异常退出时自动恢复；独立窗口保留低延迟、键鼠控制、剪贴板和拖放能力。
-- 投屏工具栏支持一键 PNG 截屏和 H.264 MP4 录屏；停止录制后选择 Mac 保存文件夹，并自动记住上次使用的位置。内嵌模式直接保存原始投屏帧，独立窗口模式使用 ScreenCaptureKit 采集对应窗口。
+- 最右侧投屏栏默认隐藏，不再长期占用手机文件区；iPhone 可选“内嵌显示 / 独立窗口”，Android 固定使用 scrcpy 独立窗口。iPhone 无需登录 Apple ID，也不需要先插数据线即可从“无线连接”启动 AirPlay 接收器。
+- Android 独立窗口保留低延迟、键鼠控制、剪贴板和拖放能力，避免内嵌采集造成的额外窗口与稳定性问题。
+- 投屏工具栏支持一键 PNG 截屏和 H.264 MP4 录屏；停止录制后可修改录像名称并选择 Mac 保存位置，窗口会自动记住上次使用的文件夹。iPhone 两种显示方式都直接保存接收到的原始投屏帧；Android 独立窗口使用 ScreenCaptureKit 采集对应窗口。
 
 ## 构建
 
@@ -91,7 +93,7 @@ iPhone 读取使用 Apple 自带的 ImageCaptureCore，不依赖越狱、私有�
 
 iOS 不允许通过 ImageCaptureCore 任意写入照片库或文件系统。PhoneBridge 会把 Mac 文件放到带一次性令牌的本地下载页：在 iPhone 面板点击“传输到手机”或直接把 Mac 文件拖入面板，扫码后逐个下载，并在 iOS 分享菜单中选择保存目录。证书下载后仍需手动安装描述文件并开启完全信任。
 
-iPhone 投屏使用 GPLv3 开源项目 UxPlay 接收 AirPlay。内嵌模式通过 GStreamer 解码为 JPEG 图像流，再经本机 TCP 通道显示到最右侧投屏栏；独立模式由 UxPlay/GStreamer 创建单独窗口。开发环境会自动查找 `/opt/homebrew/bin/uxplay` 或对应的 `/usr/local/bin` 路径；DMG 发布版内置 UxPlay 与所需组件。两种方式都不需要屏幕录制权限。
+iPhone 投屏使用 GPLv3 开源项目 UxPlay 接收 AirPlay。两种显示方式都通过 GStreamer 解码为 JPEG 图像流，再经本机 TCP 通道交给 PhoneBridge；内嵌模式显示在最右侧投屏栏，独立模式由 PhoneBridge 原生窗口显示。开发环境会自动查找 `/opt/homebrew/bin/uxplay` 或对应的 `/usr/local/bin` 路径；DMG 发布版内置 UxPlay 与所需组件。两种方式都不需要屏幕录制权限。
 
 安装 UxPlay：
 
@@ -119,11 +121,11 @@ cmake --install build --prefix /opt/homebrew
 - 拖拽目前发生在 PhoneBridge 左右面板之间，尚未实现直接拖到 Finder。
 - Android 仅显示文件夹、图片和视频，其他文件会被过滤。
 - iPhone 侧是按日期排序的平铺媒体列表，不展示 iOS 内部 DCIM 目录结构。
-- iPhone AirPlay 和 Android scrcpy 都可在内嵌侧栏与独立窗口之间切换。
+- iPhone AirPlay 可在内嵌侧栏与独立窗口之间切换；Android scrcpy 只使用独立窗口。
 - 多设备文件面板可同时展开，但内嵌 iPhone 投屏同一时间只保留一个活动设备。
 - iPhone 普通 AirPlay 需要与 Mac 处于可互相发现的局域网；公司 Wi-Fi 若屏蔽 Bonjour/mDNS，设备可能无法出现。附近设备模式可绕开部分局域网限制，但仍受机型、系统版本和无线环境影响。
 - iPhone 暂不支持由 Mac 静默写入任意系统目录；Mac 文件通过无线下载页交给 iOS，保存位置由用户在“存储到文件”中选择。
-- 已使用真实 iPhone 和 Pixel 8a 验证媒体读取、缩略图、筛选、排序和传输；Pixel 8a 的 Android 内嵌投屏已实测收到 576×1280 画面。
+- 已使用真实 iPhone 和 Pixel 8a 验证媒体读取、缩略图、筛选、排序、传输与 Android scrcpy 独立窗口投屏。
 
 ## 开源许可
 
