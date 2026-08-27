@@ -116,6 +116,17 @@ cmake --install build --prefix /opt/homebrew
 
 脚本会构建应用、封装 UxPlay/GStreamer 和 scrcpy/ADB、重写动态库路径、执行签名检查，并在 `dist/` 下生成无需 Homebrew 的 Apple Silicon DMG。
 
+## GitHub 自动发布
+
+仓库通过 [`.github/workflows/release.yml`](.github/workflows/release.yml) 自动构建 Release：
+
+1. 在 `Resources/Info.plist` 中递增版本号和 Build。
+2. 在 `CHANGELOG.md` 顶部增加对应版本记录。
+3. 提交并推送到 `main`。
+4. GitHub Actions 先执行 Release 编译；如果 `v<版本号>` 尚未发布，则自动构建 UxPlay、下载并校验官方 scrcpy、生成自包含 DMG、创建标签和 GitHub Release。
+
+若该版本已经存在，普通推送只做编译检查，不会重复覆盖 Release。需要重新生成同版本安装包时，可在 GitHub 的 Actions 页面手动运行 `Build and release`，并开启 `force_release`。
+
 ## 已知边界
 
 - 拖拽目前发生在 PhoneBridge 左右面板之间，尚未实现直接拖到 Finder。

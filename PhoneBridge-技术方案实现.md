@@ -849,7 +849,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 生成：
 
 ```text
-dist/PhoneBridge-0.14.1-AppleSilicon.dmg
+dist/PhoneBridge-0.14.2-AppleSilicon.dmg
 ```
 
 DMG 包含：
@@ -860,7 +860,19 @@ DMG 包含：
 
 脚本使用 `hdiutil create` 创建压缩 UDZO 镜像，并自动执行 `hdiutil verify` 和 SHA-256 计算。
 
-### 20.5 签名与公证
+### 20.5 GitHub Actions 自动发布
+
+`.github/workflows/release.yml` 在 `main` 推送后运行于 GitHub 官方 `macos-15` ARM64 runner：
+
+1. 读取 `Info.plist` 的版本号和 Build，并执行 Swift Release 编译。
+2. 若对应 `v<版本号>` Release 已存在，则跳过重复打包；手动运行时可使用 `force_release` 强制重建。
+3. 安装固定构建依赖，检出固定 UxPlay 提交，并下载 scrcpy v4.1 官方 Apple Silicon 资源及校验文件。
+4. 调用本地同一套 `package_dmg.sh`，检查 arm64、版本、签名、内置依赖、DMG CRC 和 SHA-256。
+5. 自动创建 Git 标签和 GitHub Release，或在强制模式下覆盖同版本 DMG 与发布说明。
+
+流水线拥有最小 `contents: write` 权限，只用于创建标签、Release 和上传安装包。第三方源码/二进制版本在工作流中固定，scrcpy 下载后使用官方 `SHA256SUMS.txt` 校验。
+
+### 20.6 签名与公证
 
 当前为 ad-hoc 临时签名：
 
@@ -906,10 +918,10 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 
 ### 22.1 已完成验证
 
-- PhoneBridge 0.14.1 Release 编译通过，无 Swift 编译警告。
+- PhoneBridge 0.14.2 Release 编译通过，无 Swift 编译警告。
 - 主程序为 arm64 Mach-O。
 - DMG 创建、CRC 校验和只读挂载通过。
-- DMG 内 App 版本为 0.14.1，Build 25。
+- DMG 内 App 版本为 0.14.2，Build 26。
 - DMG 内 App 深度签名校验通过。
 - UxPlay、GStreamer、scrcpy、ADB 已封装。
 - UxPlay 启动检查所需的 `libav`、`autodetect` 插件及递归动态库已封装；使用包内运行环境启动后未再立即以插件缺失退出。
@@ -920,7 +932,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 - 8MB 合成文件的普通分段 POST 与 `Expect: 100-continue` 上传均成功，接收文件与源文件 SHA-256 一致。
 - 真实 iPhone 已验证媒体读取、缩略图、筛选、排序和批量勾选界面。
 - 真实 Pixel 8a 已验证照片/视频自动扫描、图片/视频缩略图和 Android→Mac 传输。
-- Pixel 8a 内嵌投屏已收到 576×1280 画面，验证时帧率约 28fps；独立窗口进程也已验证启动。
+- Pixel 8a 的 scrcpy 独立窗口已验证启动；Android 内嵌投屏已从产品和代码中移除。
 - Pixel 8a 小图传到 Mac 后，文件修改时间与传输完成时间一致。
 - Mac 空白区右键菜单、新建文件夹、新建空文件、文件右键拷贝已通过实际 UI 操作验证。
 - Pixel 8a 文本接收已验证：`adb reverse` 建立 USB 端口映射，Chrome 实际打开 `127.0.0.1` 一次性地址，页面显示复制、系统分享和打开链接入口。
@@ -992,6 +1004,6 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 ### P2：正式分发
 
 - 固定和缓存第三方依赖版本。
-- 接入 Developer ID 签名、公证和自动发布流水线。
+- 在现有自动发布流水线中接入 Developer ID 签名、公证与 stapling。
 - 生成 SBOM、许可证清单和版本变更日志。
 - 增加升级检查和版本回滚说明。

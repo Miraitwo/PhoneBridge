@@ -15,11 +15,13 @@ UXPLAY_SOURCE_DIR="${UXPLAY_SOURCE_DIR:-$PROJECT_DIR/../../work/UxPlay}"
 SCRCPY_RELEASE_DIR="${SCRCPY_RELEASE_DIR:-$PROJECT_DIR/../../work/scrcpy-official/scrcpy-macos-aarch64-v4.1}"
 SIGN_IDENTITY="${PHONEBRIDGE_SIGN_IDENTITY:--}"
 
-UXPLAY_BIN="/opt/homebrew/bin/uxplay"
-GSTREAMER_ROOT="/opt/homebrew/opt/gstreamer"
+BREW_PREFIX="${PHONEBRIDGE_HOMEBREW_PREFIX:-$(brew --prefix)}"
+BREW_CELLAR="${PHONEBRIDGE_HOMEBREW_CELLAR:-$(brew --cellar)}"
+UXPLAY_BIN="${UXPLAY_BIN:-$BREW_PREFIX/bin/uxplay}"
+GSTREAMER_ROOT="${GSTREAMER_ROOT:-$(brew --prefix gstreamer)}"
 GSTREAMER_PLUGIN_DIR="$GSTREAMER_ROOT/lib/gstreamer-1.0"
 GSTREAMER_SCANNER="$GSTREAMER_ROOT/libexec/gstreamer-1.0/gst-plugin-scanner"
-FFMPEG_ROOT="/opt/homebrew/opt/ffmpeg"
+FFMPEG_ROOT="${FFMPEG_ROOT:-$(brew --prefix ffmpeg)}"
 
 if [[ ! -d "$APP_DIR" ]]; then
     echo "请先运行 scripts/build_app.sh。" >&2
@@ -80,12 +82,12 @@ resolve_homebrew_dependency() {
     local basename_value
     basename_value="$(basename "$dependency")"
 
-    if [[ "$dependency" == /opt/homebrew/* && -e "$dependency" ]]; then
+    if [[ "$dependency" == "$BREW_PREFIX"/* && -e "$dependency" ]]; then
         printf '%s\n' "$dependency"
         return 0
     fi
 
-    find -L /opt/homebrew/Cellar -type f -name "$basename_value" -print 2>/dev/null \
+    find -L "$BREW_CELLAR" -type f -name "$basename_value" -print 2>/dev/null \
         | sort -V \
         | head -n 1
 }
@@ -97,7 +99,7 @@ while IFS= read -r current_file; do
 
     while IFS= read -r dependency; do
         case "$dependency" in
-            /opt/homebrew/*.dylib|@rpath/*.dylib)
+            "$BREW_PREFIX"/*.dylib|@rpath/*.dylib)
                 dependency_basename="$(basename "$dependency")"
                 if [[ "$current_file" == *.dylib && "$dependency_basename" == "$(basename "$current_file")" ]]; then
                     continue
@@ -190,11 +192,11 @@ done < <(find "$CONTENTS_DIR" -type f -print0)
 
 cp "$UXPLAY_SOURCE_DIR/LICENSE" "$LICENSES_DIR/UxPlay-GPL-3.0.txt"
 cp "$SCRCPY_RELEASE_DIR/LICENSE" "$LICENSES_DIR/scrcpy-Apache-2.0.txt"
-cp "/opt/homebrew/Cellar/gstreamer/1.28.6_1/LICENSE" "$LICENSES_DIR/GStreamer-LGPL-2.1.txt"
-cp "/opt/homebrew/Cellar/gettext/1.0/COPYING" "$LICENSES_DIR/gettext-GPL.txt"
-cp "/opt/homebrew/Cellar/pcre2/10.47_1/COPYING" "$LICENSES_DIR/PCRE2.txt"
-cp "/opt/homebrew/Cellar/orc/0.4.42/COPYING" "$LICENSES_DIR/ORC.txt"
-cp "/opt/homebrew/Cellar/jpeg-turbo/3.2.0/LICENSE.md" "$LICENSES_DIR/libjpeg-turbo.txt"
+cp "$(brew --prefix gstreamer)/LICENSE" "$LICENSES_DIR/GStreamer-LGPL-2.1.txt"
+cp "$(brew --prefix gettext)/COPYING" "$LICENSES_DIR/gettext-GPL.txt"
+cp "$(brew --prefix pcre2)/COPYING" "$LICENSES_DIR/PCRE2.txt"
+cp "$(brew --prefix orc)/COPYING" "$LICENSES_DIR/ORC.txt"
+cp "$(brew --prefix jpeg-turbo)/LICENSE.md" "$LICENSES_DIR/libjpeg-turbo.txt"
 cp "$FFMPEG_ROOT/LICENSE.md" "$LICENSES_DIR/FFmpeg-LICENSE.md"
 cp "$FFMPEG_ROOT/COPYING.GPLv3" "$LICENSES_DIR/FFmpeg-GPL-3.0.txt"
 cp "$PROJECT_DIR/Resources/THIRD_PARTY_NOTICES.txt" "$LICENSES_DIR/THIRD_PARTY_NOTICES.txt"
@@ -227,11 +229,14 @@ while IFS= read -r -d '' verified_file; do
     if ! file "$verified_file" | grep -q 'Mach-O'; then
         continue
     fi
-    if otool -L "$verified_file" | tail -n +2 | awk '{print $1}' | grep -E '^(/opt/homebrew|/usr/local)' >/dev/null; then
-        echo "仍包含外部依赖：$verified_file" >&2
-        otool -L "$verified_file" >&2
-        unexpected_links=1
-    fi
+    while IFS= read -r dependency; do
+        case "$dependency" in
+            "$BREW_PREFIX"/*|/usr/local/*)
+                echo "仍包含外部依赖：$verified_file -> $dependency" >&2
+                unexpected_links=1
+                ;;
+        esac
+    done < <(otool -L "$verified_file" | tail -n +2 | awk '{print $1}')
 done < <(find "$CONTENTS_DIR" -type f -print0)
 
 if [[ "$unexpected_links" -ne 0 ]]; then

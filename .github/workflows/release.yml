@@ -1,0 +1,233 @@
+name: Build and release
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      force_release:
+        description: Rebuild and replace the current version's release asset
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: phonebridge-release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  HOMEBREW_NO_AUTO_UPDATE: "1"
+  SCRCPY_VERSION: "4.1"
+  UXPLAY_COMMIT: "462153392f2e30937424922039ff9f0cda5e7b1a"
+  GH_TOKEN: ${{ github.token }}
+
+jobs:
+  build-and-release:
+    name: Build Apple Silicon DMG
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verify runner architecture
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(uname -m)" = "arm64"
+          swift --version
+
+      - name: Compile release source
+        shell: bash
+        run: |
+          set -euo pipefail
+          swift build -c release
+
+      - name: Read release metadata
+        id: metadata
+        shell: bash
+        env:
+          FORCE_RELEASE: ${{ github.event_name == 'workflow_dispatch' && inputs.force_release || false }}
+        run: |
+          set -euo pipefail
+          version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' Resources/Info.plist)"
+          build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' Resources/Info.plist)"
+          tag="v${version}"
+          dmg="dist/PhoneBridge-${version}-AppleSilicon.dmg"
+
+          release_exists=false
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            release_exists=true
+          fi
+
+          should_release=true
+          if [[ "$release_exists" == "true" && "$FORCE_RELEASE" != "true" ]]; then
+            should_release=false
+          fi
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "dmg=$dmg" >> "$GITHUB_OUTPUT"
+          echo "release_exists=$release_exists" >> "$GITHUB_OUTPUT"
+          echo "should_release=$should_release" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "### PhoneBridge ${version} (Build ${build})"
+            if [[ "$should_release" == "true" ]]; then
+              echo "A DMG will be built and published as ${tag}."
+            else
+              echo "Release ${tag} already exists; packaging was skipped."
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install packaging dependencies
+        if: steps.metadata.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew install cmake pkgconf libplist openssl@3 gstreamer ffmpeg gettext pcre2 orc jpeg-turbo
+
+      - name: Build UxPlay and download scrcpy
+        if: steps.metadata.outputs.should_release == 'true'
+        id: dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          dependency_root="$RUNNER_TEMP/phonebridge-dependencies"
+          uxplay_source="$dependency_root/UxPlay"
+          uxplay_install="$dependency_root/uxplay-install"
+          scrcpy_asset="scrcpy-macos-aarch64-v${SCRCPY_VERSION}.tar.gz"
+          scrcpy_directory="$dependency_root/scrcpy-macos-aarch64-v${SCRCPY_VERSION}"
+
+          mkdir -p "$dependency_root"
+          git clone https://github.com/FDH2/UxPlay.git "$uxplay_source"
+          git -C "$uxplay_source" checkout "$UXPLAY_COMMIT"
+          cmake \
+            -S "$uxplay_source" \
+            -B "$uxplay_source/build" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX="$uxplay_install" \
+            -DNO_X11_DEPS=ON
+          cmake --build "$uxplay_source/build" --parallel "$(sysctl -n hw.ncpu)"
+          cmake --install "$uxplay_source/build"
+
+          gh release download "v${SCRCPY_VERSION}" \
+            --repo Genymobile/scrcpy \
+            --pattern "$scrcpy_asset" \
+            --pattern SHA256SUMS.txt \
+            --dir "$dependency_root"
+          (
+            cd "$dependency_root"
+            grep "  ${scrcpy_asset}$" SHA256SUMS.txt | shasum -a 256 -c -
+            tar -xzf "$scrcpy_asset"
+          )
+
+          test -x "$uxplay_install/bin/uxplay"
+          test -x "$scrcpy_directory/scrcpy"
+          test -x "$scrcpy_directory/adb"
+          test -f "$scrcpy_directory/scrcpy-server"
+
+          echo "uxplay_source=$uxplay_source" >> "$GITHUB_OUTPUT"
+          echo "uxplay_binary=$uxplay_install/bin/uxplay" >> "$GITHUB_OUTPUT"
+          echo "scrcpy_directory=$scrcpy_directory" >> "$GITHUB_OUTPUT"
+
+      - name: Build and verify DMG
+        if: steps.metadata.outputs.should_release == 'true'
+        id: package
+        shell: bash
+        env:
+          UXPLAY_SOURCE_DIR: ${{ steps.dependencies.outputs.uxplay_source }}
+          UXPLAY_BIN: ${{ steps.dependencies.outputs.uxplay_binary }}
+          SCRCPY_RELEASE_DIR: ${{ steps.dependencies.outputs.scrcpy_directory }}
+        run: |
+          set -euo pipefail
+          ./scripts/package_dmg.sh
+
+          dmg="${{ steps.metadata.outputs.dmg }}"
+          app="dist/PhoneBridge.app"
+          actual_version="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$app/Contents/Info.plist")"
+          actual_build="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' "$app/Contents/Info.plist")"
+
+          test "$actual_version" = "${{ steps.metadata.outputs.version }}"
+          test "$actual_build" = "${{ steps.metadata.outputs.build }}"
+          file "$app/Contents/MacOS/PhoneBridge" | grep -q 'arm64'
+          codesign --verify --deep --strict "$app"
+          hdiutil verify "$dmg"
+          test -x "$app/Contents/Resources/uxplay"
+          test -x "$app/Contents/Resources/scrcpy"
+          test -x "$app/Contents/Resources/adb"
+          test -f "$app/Contents/Resources/scrcpy-server"
+
+          checksum="$(shasum -a 256 "$dmg" | awk '{print $1}')"
+          echo "checksum=$checksum" >> "$GITHUB_OUTPUT"
+
+      - name: Create release notes
+        if: steps.metadata.outputs.should_release == 'true'
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ steps.metadata.outputs.version }}"
+          build="${{ steps.metadata.outputs.build }}"
+          notes="dist/PhoneBridge-${version}-release-notes.md"
+
+          awk -v version="$version" '
+            $0 ~ "^## " version { printing = 1 }
+            printing && $0 ~ "^## " && $0 !~ "^## " version { exit }
+            printing { print }
+          ' CHANGELOG.md > "$notes"
+          test -s "$notes"
+
+          {
+            echo
+            echo "## 安装包"
+            echo
+            echo "- macOS 13 及以上"
+            echo "- Apple Silicon（arm64）"
+            echo "- 版本：\`${version} (Build ${build})\`"
+            echo "- SHA-256：\`${{ steps.package.outputs.checksum }}\`"
+            echo "- 已内置 UxPlay、GStreamer、scrcpy、ADB 及运行依赖"
+            echo
+            echo "当前安装包使用 ad-hoc 签名，尚未进行 Apple Developer ID 公证。若 macOS 首次阻止启动，请在 Finder 中右键 PhoneBridge 并选择“打开”。"
+          } >> "$notes"
+
+          echo "path=$notes" >> "$GITHUB_OUTPUT"
+
+      - name: Publish GitHub Release
+        if: steps.metadata.outputs.should_release == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.metadata.outputs.tag }}"
+          title="PhoneBridge ${{ steps.metadata.outputs.version }}"
+          dmg="${{ steps.metadata.outputs.dmg }}"
+          notes="${{ steps.notes.outputs.path }}"
+
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$dmg" --repo "$GITHUB_REPOSITORY" --clobber
+            gh release edit "$tag" --repo "$GITHUB_REPOSITORY" --title "$title" --notes-file "$notes" --latest
+          else
+            if git rev-parse --verify "refs/tags/$tag" >/dev/null 2>&1; then
+              tag_commit="$(git rev-list -n 1 "$tag")"
+              test "$tag_commit" = "$GITHUB_SHA"
+            else
+              git tag "$tag" "$GITHUB_SHA"
+              git push origin "refs/tags/$tag"
+            fi
+            gh release create "$tag" "$dmg" \
+              --repo "$GITHUB_REPOSITORY" \
+              --verify-tag \
+              --title "$title" \
+              --notes-file "$notes" \
+              --latest
+          fi
+
+          echo "Release URL: https://github.com/${GITHUB_REPOSITORY}/releases/tag/${tag}" >> "$GITHUB_STEP_SUMMARY"

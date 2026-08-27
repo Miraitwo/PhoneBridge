@@ -2,11 +2,17 @@
 
 ## 0.14.2（2026-08-27）
 
+### 新增
+
+- 新增 GitHub Actions 自动发布流水线：推送 `main` 后执行 Release 编译，新版本自动生成 Apple Silicon DMG、创建标签并发布到 GitHub Releases。
+- 支持手动强制重建并替换同版本 Release 安装包。
+
 ### 调整
 
 - Android 投屏固定使用 scrcpy 独立窗口，保留低延迟、键鼠控制、剪贴板和拖放能力。
 - 移除 Android 内嵌投屏入口、ScreenCaptureKit 内嵌采集服务和自动重连逻辑，避免额外投屏窗口及内嵌不稳定问题。
 - 应用版本更新为 `0.14.2 (Build 26)`，同步更新 README、使用说明、技术方案和 DMG 安装说明。
+- 打包脚本改为动态读取 Homebrew 安装前缀和许可证路径，支持本机与 GitHub ARM64 runner 共用。
 
 ## 0.14.1（2026-08-27）
 
