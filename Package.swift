@@ -15,6 +15,7 @@ let package = Package(
             name: "PhoneBridge",
             linkerSettings: [
                 .linkedFramework("AppKit"),
+                .linkedFramework("AVFoundation"),
                 .linkedFramework("CoreImage"),
                 .linkedFramework("ImageCaptureCore"),
                 .linkedFramework("Network"),

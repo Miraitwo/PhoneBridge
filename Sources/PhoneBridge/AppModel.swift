@@ -12,6 +12,7 @@ final class AppModel: ObservableObject {
     private static let iPhonePeerToPeerPINKey = "PhoneBridge.iPhonePeerToPeerPIN"
     private static let iPhoneMirrorModeKey = "PhoneBridge.iPhoneMirrorMode"
     private static let androidMirrorModeKey = "PhoneBridge.androidMirrorMode"
+    private static let lastMirrorCaptureDirectoryKey = "PhoneBridge.lastMirrorCaptureDirectory"
 
     private struct PendingTransfer {
         let jobID: UUID
@@ -57,6 +58,7 @@ final class AppModel: ObservableObject {
     let mirroringService = ScreenMirroringService()
     let embeddedIPhoneMirrorService = EmbeddedIPhoneMirrorService()
     let embeddedAndroidMirrorService = EmbeddedAndroidMirrorService()
+    let mirrorCaptureService = MirrorCaptureService()
     let wirelessTransferService = WirelessTransferService()
 
     private var androidDevices: [PhoneDevice] = []
@@ -75,6 +77,7 @@ final class AppModel: ObservableObject {
     private let thumbnailCache = NSCache<NSString, NSData>()
     private var thumbnailLoads: [String: Task<Data?, Never>] = [:]
     private let androidThumbnailLimiter = AndroidThumbnailLimiter(limit: 2)
+    private var cancellables = Set<AnyCancellable>()
 
     init() {
         let fileManager = FileManager.default
@@ -146,6 +149,16 @@ final class AppModel: ObservableObject {
         embeddedAndroidMirrorService.onStatus = { [weak self] message in
             self?.statusMessage = message
         }
+        mirrorCaptureService.onStatus = { [weak self] message in
+            self?.statusMessage = message
+        }
+        mirrorCaptureService.onError = { [weak self] message in
+            self?.errorMessage = message
+            self?.statusMessage = message
+        }
+        mirrorCaptureService.objectWillChange
+            .sink { [weak self] in self?.objectWillChange.send() }
+            .store(in: &cancellables)
         wirelessTransferService.onStatus = { [weak self] message in
             self?.statusMessage = message
         }
@@ -633,6 +646,7 @@ final class AppModel: ObservableObject {
 
     func stopSelectedAndroidMirroring() {
         guard let deviceID = selectedDeviceID, selectedDevice?.platform == .android else { return }
+        if mirrorCaptureService.isRecording { stopMirrorRecording() }
         embeddedAndroidMirrorService.stop()
         if embeddedAndroidDeviceID == deviceID { embeddedAndroidDeviceID = nil }
         embeddedAndroidRestartTask?.cancel()
@@ -803,9 +817,162 @@ final class AppModel: ObservableObject {
     }
 
     func stopIPhoneMirroring() {
+        if mirrorCaptureService.isRecording { stopMirrorRecording() }
         mirroringService.stopIPhoneAirPlay()
         embeddedIPhoneMirrorService.stop()
         if activeMirrorPlatform == .ios { activeMirrorPlatform = nil }
+    }
+
+    func captureMirrorScreenshot() {
+        guard let source = currentMirrorCaptureSource() else {
+            errorMessage = "请先启动投屏并等待手机画面出现。"
+            statusMessage = errorMessage ?? "投屏尚未启动。"
+            return
+        }
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let image = try await self.mirrorCaptureService.captureFrame(from: source)
+                let representation = NSBitmapImageRep(cgImage: image)
+                guard let data = representation.representation(using: .png, properties: [:]) else {
+                    throw PhoneBridgeError.commandFailed("无法生成 PNG 截图。")
+                }
+
+                let panel = NSSavePanel()
+                panel.title = "保存投屏截图"
+                panel.prompt = "保存"
+                panel.allowedContentTypes = [.png]
+                panel.canCreateDirectories = true
+                panel.directoryURL = self.lastMirrorCaptureDirectory()
+                panel.nameFieldStringValue = "PhoneBridge-截图-\(Self.mirrorCaptureTimestamp()).png"
+                guard panel.runModal() == .OK, let destination = panel.url else {
+                    self.statusMessage = "已取消保存截图。"
+                    return
+                }
+                try data.write(to: destination, options: .atomic)
+                self.rememberMirrorCaptureDirectory(destination.deletingLastPathComponent())
+                self.statusMessage = "截图已保存：\(destination.lastPathComponent)"
+            } catch {
+                self.show(error)
+            }
+        }
+    }
+
+    func startMirrorRecording() {
+        guard let source = currentMirrorCaptureSource() else {
+            errorMessage = "请先启动投屏并等待手机画面出现。"
+            statusMessage = errorMessage ?? "投屏尚未启动。"
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try await self.mirrorCaptureService.startRecording(from: source)
+            } catch {
+                self.show(error)
+            }
+        }
+    }
+
+    func stopMirrorRecording() {
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                guard try await self.mirrorCaptureService.stopRecording() != nil else { return }
+                self.savePendingMirrorRecording()
+            } catch {
+                self.show(error)
+            }
+        }
+    }
+
+    func savePendingMirrorRecording() {
+        guard let source = mirrorCaptureService.pendingRecordingURL else {
+            statusMessage = "没有待保存的录屏。"
+            return
+        }
+
+        let panel = NSOpenPanel()
+        panel.title = "选择录屏保存文件夹"
+        panel.message = "录屏完成后将保存到所选文件夹；下次会默认打开此位置。"
+        panel.prompt = "保存到此文件夹"
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.canCreateDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.directoryURL = lastMirrorCaptureDirectory()
+        guard panel.runModal() == .OK, let directory = panel.url else {
+            statusMessage = "已保留本次录屏；点击“保存录像”可再次选择文件夹。"
+            return
+        }
+
+        let preferredName = mirrorCaptureService.pendingRecordingFilename
+            ?? "PhoneBridge-录屏-\(Self.mirrorCaptureTimestamp()).mp4"
+        var reservedPaths = Set<String>()
+        let destination = uniqueDestination(
+            directory: directory,
+            filename: preferredName,
+            reservedPaths: &reservedPaths
+        )
+        do {
+            try FileManager.default.moveItem(at: source, to: destination)
+            mirrorCaptureService.markPendingRecordingSaved()
+            rememberMirrorCaptureDirectory(directory)
+            statusMessage = "录屏已保存：\(destination.lastPathComponent)"
+        } catch {
+            show(error)
+        }
+    }
+
+    private func currentMirrorCaptureSource() -> MirrorCaptureSource? {
+        switch activeMirrorPlatform ?? selectedDevice?.platform {
+        case .ios:
+            switch iPhoneMirrorMode {
+            case .embedded:
+                return .embedded { [weak self] in self?.embeddedIPhoneMirrorService.latestFrame }
+            case .separateWindow:
+                guard let processID = mirroringService.iPhoneAirPlayProcessID else { return nil }
+                return .separateWindow(processID: processID)
+            }
+
+        case .android:
+            let deviceID = embeddedAndroidDeviceID ?? selectedDeviceID
+            guard let deviceID else { return nil }
+            switch androidMirrorMode {
+            case .embedded:
+                return .embedded { [weak self] in self?.embeddedAndroidMirrorService.latestFrame }
+            case .separateWindow:
+                guard let processID = mirroringService.androidMirrorProcessID(deviceID: deviceID) else { return nil }
+                return .separateWindow(processID: processID)
+            }
+
+        case nil:
+            return nil
+        }
+    }
+
+    private func lastMirrorCaptureDirectory() -> URL {
+        if let savedPath = UserDefaults.standard.string(forKey: Self.lastMirrorCaptureDirectoryKey) {
+            let savedURL = URL(fileURLWithPath: savedPath, isDirectory: true)
+            var isDirectory: ObjCBool = false
+            if FileManager.default.fileExists(atPath: savedURL.path, isDirectory: &isDirectory),
+               isDirectory.boolValue {
+                return savedURL
+            }
+        }
+        return localPath
+    }
+
+    private func rememberMirrorCaptureDirectory(_ directory: URL) {
+        UserDefaults.standard.set(directory.path, forKey: Self.lastMirrorCaptureDirectoryKey)
+    }
+
+    private static func mirrorCaptureTimestamp() -> String {
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "zh_CN")
+        formatter.dateFormat = "yyyyMMdd-HHmmss"
+        return formatter.string(from: Date())
     }
 
     func localParent() {

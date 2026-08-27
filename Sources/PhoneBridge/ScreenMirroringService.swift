@@ -20,6 +20,7 @@ final class ScreenMirroringService {
     private var uxPlayOutputPipe: Pipe?
     private var uxPlayLogTail: [String] = []
     private var isStoppingUxPlay = false
+    private var hasActivatedIPhoneWindow = false
     private var iPhoneAirPlayReceiverName = "PhoneBridge"
     private(set) var iPhoneAirPlayMode: IPhoneMirrorMode?
 
@@ -124,6 +125,11 @@ final class ScreenMirroringService {
         return scrcpyModes[deviceID]
     }
 
+    func androidMirrorProcessID(deviceID: String) -> pid_t? {
+        guard let process = scrcpyProcesses[deviceID], process.isRunning else { return nil }
+        return process.processIdentifier
+    }
+
     private func androidWindowTitle(device: PhoneDevice, mode: AndroidMirrorMode) -> String {
         switch mode {
         case .embedded: return "PhoneBridge Embedded · \(device.id)"
@@ -175,6 +181,12 @@ final class ScreenMirroringService {
             arguments.append(contentsOf: [
                 "-vs", "jpegenc quality=\(quality.jpegQuality) ! tcpclientsink host=127.0.0.1 port=\(streamPort)"
             ])
+        } else if mode == .separateWindow {
+            // The macOS AVSampleBuffer sink is intentionally registered with
+            // rank "none", so UxPlay's default autovideosink cannot discover
+            // it reliably in the self-contained app runtime. Select it
+            // explicitly so an AirPlay connection always creates a window.
+            arguments.append(contentsOf: ["-vs", "avsamplebufferlayersink"])
         }
         if peerToPeer {
             arguments.append("-p2p")
@@ -193,6 +205,7 @@ final class ScreenMirroringService {
 
         uxPlayLogTail = []
         isStoppingUxPlay = false
+        hasActivatedIPhoneWindow = false
         outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let message = String(data: data, encoding: .utf8) else { return }
@@ -210,6 +223,7 @@ final class ScreenMirroringService {
                 self.uxPlayProcess = nil
                 self.iPhoneAirPlayMode = nil
                 self.isStoppingUxPlay = false
+                self.hasActivatedIPhoneWindow = false
 
                 if wasStoppedByUser || finishedProcess.terminationStatus == 0 {
                     self.onStatus?("AirPlay 投屏已停止。")
@@ -248,6 +262,7 @@ final class ScreenMirroringService {
         uxPlayOutputPipe = nil
         uxPlayProcess = nil
         iPhoneAirPlayMode = nil
+        hasActivatedIPhoneWindow = false
         process.interrupt()
         onStatus?("正在停止 AirPlay 投屏…")
     }
@@ -266,8 +281,30 @@ final class ScreenMirroringService {
         if lines.contains(where: { $0.contains("Initialized server socket") }) {
             onStatus?("AirPlay 接收器已启动。请在 iPhone 控制中心 → 屏幕镜像中选择“\(iPhoneAirPlayReceiverName)”。")
         }
+        if iPhoneAirPlayMode == .separateWindow,
+           !hasActivatedIPhoneWindow,
+           lines.contains(where: {
+               $0.contains("Begin streaming to GStreamer video pipeline")
+                   || $0.contains("raop_rtp_mirror starting mirroring")
+                   || $0.contains("Initialized GStreamer video renderer")
+           }) {
+            hasActivatedIPhoneWindow = true
+            activateIPhoneMirrorWindow()
+        }
         if lines.contains(where: { $0.contains("SO_RECV_ANYIF") && $0.localizedCaseInsensitiveContains("failed") }) {
             onError?("附近设备 AirPlay 启动失败。请确认 Mac 的 Wi-Fi、蓝牙和本地网络权限已开启，再重新启动接收器。")
+        }
+    }
+
+    private func activateIPhoneMirrorWindow() {
+        guard let processID = iPhoneAirPlayProcessID else { return }
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 450_000_000)
+            guard self?.iPhoneAirPlayProcessID == processID else { return }
+            if let application = NSRunningApplication(processIdentifier: processID) {
+                application.activate(options: [.activateAllWindows, .activateIgnoringOtherApps])
+            }
+            self?.onStatus?("iPhone 独立投屏窗口已打开。")
         }
     }
 

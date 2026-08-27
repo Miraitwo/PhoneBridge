@@ -1,6 +1,6 @@
 # PhoneBridge 技术方案与实现说明
 
-> 适用版本：PhoneBridge 0.13.0（Build 23）
+> 适用版本：PhoneBridge 0.14.0（Build 24）
 > 文档定位：架构设计、关键实现、构建发布、验证现状和后续演进
 > 目标平台：Apple Silicon macOS 13+
 
@@ -653,7 +653,7 @@ sequenceDiagram
     R-->>V: latestFrame, resolution, fps
 ```
 
-独立窗口模式跳过本地 TCP/JPEG 接收器，不传 `-vs`，让 UxPlay 使用默认 `autovideosink` 创建渲染窗口；内嵌模式继续使用上图链路。
+独立窗口模式跳过本地 TCP/JPEG 接收器，并显式传入 `-vs avsamplebufferlayersink`。安装包中的 macOS AVSampleBuffer 视频输出组件注册优先级为 `none`，默认 `autovideosink` 无法稳定自动选择；显式指定后由 UxPlay/GStreamer 创建渲染窗口，并在检测到视频流启动日志后将窗口带到前台。内嵌模式继续使用上图链路。
 
 ### 16.2 UxPlay 参数
 
@@ -663,7 +663,7 @@ sequenceDiagram
 
 ```text
 -n <receiverName>   发布到 iPhone“屏幕镜像”列表的接收名称
--nh                 不显示 UxPlay 自有窗口
+-nh                 AirPlay 名称末尾不追加 Mac 主机名
 -as 0               关闭音频输出
 -vsync no           不做 UxPlay 侧垂直同步
 -s <resolution>     请求视频分辨率
@@ -738,6 +738,17 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 - 投屏运行中改名时，先停止当前 UxPlay，再以新 `-n` 参数自动启动；iPhone 需要重新选择接收器。
 - 投屏侧栏直接显示生效后的名称，便于多人环境现场核对。
 
+### 16.8 投屏截屏与录屏
+
+`MirrorCaptureService` 将四种投屏组合统一为 `MirrorCaptureSource`：
+
+- iPhone / Android 内嵌模式直接读取对应服务的最新 `CGImage`，避免重复采集。
+- iPhone / Android 独立窗口根据 UxPlay 或 scrcpy 的进程 ID，通过 `SCShareableContent` 找到面积最大的投屏窗口，再用 `SCStream` 持续接收窗口帧。
+
+截屏使用 `NSBitmapImageRep` 输出 PNG。录屏使用 `AVAssetWriter`、`AVAssetWriterInputPixelBufferAdaptor` 和 H.264 编码；按原始宽高比缩放到最长边不超过 1920 像素的偶数尺寸，空余区域使用黑色填充，时间戳采用实际录制时长而非固定帧序号。
+
+录制先写入系统临时目录，结束并成功封装 MP4 后再弹出文件夹选择器。用户取消选择时保留临时文件，并在工具栏显示“保存录像”；成功移动到目标目录后才清除待保存状态。独立窗口采集需要 macOS 屏幕录制权限，内嵌帧保存不额外申请权限。
+
 ## 17. 配置持久化
 
 使用 `UserDefaults` 保存：
@@ -751,6 +762,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 | `PhoneBridge.iPhonePeerToPeerPIN` | 4 位附近投屏 PIN |
 | `PhoneBridge.iPhoneMirrorMode` | iPhone 投屏的内嵌 / 独立窗口偏好 |
 | `PhoneBridge.androidMirrorMode` | Android 投屏的内嵌 / 独立窗口偏好 |
+| `PhoneBridge.lastMirrorCaptureDirectory` | 上次投屏截图或录像的保存文件夹 |
 
 设备面板顺序、搜索、筛选、排序和勾选状态当前不跨应用重启保存。
 
@@ -845,7 +857,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 生成：
 
 ```text
-dist/PhoneBridge-0.13.0-AppleSilicon.dmg
+dist/PhoneBridge-0.14.0-AppleSilicon.dmg
 ```
 
 DMG 包含：
@@ -902,10 +914,10 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 
 ### 22.1 已完成验证
 
-- PhoneBridge 0.13.0 Release 编译通过，无 Swift 编译警告。
+- PhoneBridge 0.14.0 Release 编译通过，无 Swift 编译警告。
 - 主程序为 arm64 Mach-O。
 - DMG 创建、CRC 校验和只读挂载通过。
-- DMG 内 App 版本为 0.13.0，Build 23。
+- DMG 内 App 版本为 0.14.0，Build 24。
 - DMG 内 App 深度签名校验通过。
 - UxPlay、GStreamer、scrcpy、ADB 已封装。
 - UxPlay 启动检查所需的 `libav`、`autodetect` 插件及递归动态库已封装；使用包内运行环境启动后未再立即以插件缺失退出。
@@ -923,6 +935,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 - Mac 面板已改为单一 AppKit 父级拖拽接收器，Release 构建和多设备界面加载通过。
 - Mac 路径面包屑已通过实际 UI 点击验证，可从深层目录直接跳到上层。
 - 打包内 UxPlay 已在没有 USB iPhone 的情况下使用 `-p2p -pin` 启动，并输出 `Initialized server socket(s)`；实际 iPhone 发现仍需做机型/现场无线覆盖。
+- 合成 720×1280 画面录屏验证通过：生成 H.264 MP4，视频尺寸、时长和首帧均可正常解析。
 
 ### 22.2 仍需实机覆盖
 

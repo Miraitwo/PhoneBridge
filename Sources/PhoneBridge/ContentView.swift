@@ -775,6 +775,20 @@ struct ContentView: View {
                     detail: "连接并解锁手机后，可以在这里启动投屏。"
                 )
             }
+
+            if model.activeMirrorPlatform != nil
+                || model.mirrorCaptureService.isRecording
+                || model.mirrorCaptureService.isFinishing
+                || model.mirrorCaptureService.hasPendingRecording {
+                Divider()
+                MirrorCaptureToolbar(
+                    service: model.mirrorCaptureService,
+                    onScreenshot: model.captureMirrorScreenshot,
+                    onStartRecording: model.startMirrorRecording,
+                    onStopRecording: model.stopMirrorRecording,
+                    onSavePendingRecording: model.savePendingMirrorRecording
+                )
+            }
         }
         .background(Color(nsColor: .textBackgroundColor))
     }
@@ -1283,6 +1297,74 @@ struct ContentView: View {
         case .failed: return .red
         default: return .secondary
         }
+    }
+}
+
+private struct MirrorCaptureToolbar: View {
+    @ObservedObject var service: MirrorCaptureService
+    let onScreenshot: () -> Void
+    let onStartRecording: () -> Void
+    let onStopRecording: () -> Void
+    let onSavePendingRecording: () -> Void
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Button(action: onScreenshot) {
+                Label("截屏", systemImage: "camera")
+            }
+            .buttonStyle(.bordered)
+            .disabled(service.isFinishing)
+
+            if service.isRecording {
+                Button(action: onStopRecording) {
+                    Label("停止并保存", systemImage: "stop.circle.fill")
+                }
+                .buttonStyle(.borderedProminent)
+                .tint(.red)
+
+                HStack(spacing: 5) {
+                    Circle()
+                        .fill(.red)
+                        .frame(width: 7, height: 7)
+                    Text(Self.durationText(service.recordingDuration))
+                        .monospacedDigit()
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            } else {
+                Button(action: onStartRecording) {
+                    Label("开始录屏", systemImage: "record.circle")
+                }
+                .buttonStyle(.bordered)
+                .disabled(service.isFinishing || service.hasPendingRecording)
+            }
+
+            if service.isFinishing {
+                ProgressView()
+                    .controlSize(.small)
+                Text("正在生成视频…")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            if service.hasPendingRecording {
+                Button(action: onSavePendingRecording) {
+                    Label("保存录像", systemImage: "folder.badge.plus")
+                }
+                .buttonStyle(.borderedProminent)
+            }
+        }
+        .controlSize(.small)
+        .padding(.horizontal, 12)
+        .padding(.vertical, 8)
+        .background(Color(nsColor: .controlBackgroundColor))
+    }
+
+    private static func durationText(_ duration: TimeInterval) -> String {
+        let seconds = max(0, Int(duration))
+        return String(format: "%02d:%02d", seconds / 60, seconds % 60)
     }
 }
 
