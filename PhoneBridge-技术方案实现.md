@@ -866,7 +866,7 @@ DMG 包含：
 
 1. 读取 `Info.plist` 的版本号和 Build，并执行 Swift Release 编译。
 2. 若对应 `v<版本号>` Release 已存在，则跳过重复打包；手动运行时可使用 `force_release` 强制重建。
-3. 安装固定构建依赖，检出固定 UxPlay 提交，并下载 scrcpy v4.1 官方 Apple Silicon 资源及校验文件。
+3. 安装固定构建依赖，检出 UxPlay 官方 Release v1.73.6，并下载 scrcpy v4.1 官方 Apple Silicon 资源及校验文件。
 4. 调用本地同一套 `package_dmg.sh`，检查 arm64、版本、签名、内置依赖、DMG CRC 和 SHA-256。
 5. 自动创建 Git 标签和 GitHub Release，或在强制模式下覆盖同版本 DMG 与发布说明。
 

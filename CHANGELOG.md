@@ -4,7 +4,7 @@
 
 ### 新增
 
-- 新增 GitHub Actions 自动发布流水线：推送 `main` 后执行 Release 编译，新版本自动生成 Apple Silicon DMG、创建标签并发布到 GitHub Releases。
+- 新增 GitHub Actions 自动发布流水线：推送 `main` 后执行 Release 编译，新版本使用 UxPlay v1.73.6 和 scrcpy v4.1 自动生成 Apple Silicon DMG、创建标签并发布到 GitHub Releases。
 - 支持手动强制重建并替换同版本 Release 安装包。
 
 ### 调整

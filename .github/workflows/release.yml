@@ -22,7 +22,7 @@ concurrency:
 env:
   HOMEBREW_NO_AUTO_UPDATE: "1"
   SCRCPY_VERSION: "4.1"
-  UXPLAY_COMMIT: "462153392f2e30937424922039ff9f0cda5e7b1a"
+  UXPLAY_VERSION: "v1.73.6"
   GH_TOKEN: ${{ github.token }}
 
 jobs:
@@ -33,7 +33,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -108,8 +108,11 @@ jobs:
           scrcpy_directory="$dependency_root/scrcpy-macos-aarch64-v${SCRCPY_VERSION}"
 
           mkdir -p "$dependency_root"
-          git clone https://github.com/FDH2/UxPlay.git "$uxplay_source"
-          git -C "$uxplay_source" checkout "$UXPLAY_COMMIT"
+          git clone \
+            --branch "$UXPLAY_VERSION" \
+            --depth 1 \
+            https://github.com/FDH2/UxPlay.git \
+            "$uxplay_source"
           cmake \
             -S "$uxplay_source" \
             -B "$uxplay_source/build" \
