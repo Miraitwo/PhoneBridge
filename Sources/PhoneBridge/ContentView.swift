@@ -170,7 +170,7 @@ struct ContentView: View {
                     searchPlaceholder: "搜索 Mac"
                 )
 
-                columnHeader(sort: $localSort)
+                columnHeader(sort: $localSort, onSort: model.refreshLocal)
                 GeometryReader { geometry in
                     ScrollView {
                         LazyVStack(spacing: 0) {
@@ -394,7 +394,10 @@ struct ContentView: View {
             .padding(.vertical, 6)
             .background(Color(nsColor: .controlBackgroundColor))
 
-            columnHeader(sort: remoteSortBinding(for: deviceID))
+            columnHeader(
+                sort: remoteSortBinding(for: deviceID),
+                onSort: { Task { await model.refreshRemote(deviceID: deviceID) } }
+            )
             if entries.isEmpty {
                 EmptyStateView(
                     title: hasActiveRemoteFilter(deviceID: deviceID) ? "没有匹配的文件" : "没有可显示的媒体",
@@ -916,13 +919,16 @@ struct ContentView: View {
         return result
     }
 
-    private func columnHeader(sort: Binding<FileSortOption>) -> some View {
+    private func columnHeader(
+        sort: Binding<FileSortOption>,
+        onSort: @escaping () -> Void
+    ) -> some View {
         HStack(spacing: 8) {
-            sortHeaderButton("名称", field: .name, sort: sort, alignment: .leading)
+            sortHeaderButton("名称", field: .name, sort: sort, alignment: .leading, onSort: onSort)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            sortHeaderButton("大小", field: .size, sort: sort, alignment: .trailing)
+            sortHeaderButton("大小", field: .size, sort: sort, alignment: .trailing, onSort: onSort)
                 .frame(width: 84, alignment: .trailing)
-            sortHeaderButton("日期", field: .date, sort: sort, alignment: .trailing)
+            sortHeaderButton("日期", field: .date, sort: sort, alignment: .trailing, onSort: onSort)
                 .frame(width: 130, alignment: .trailing)
         }
         .font(.caption)
@@ -936,7 +942,8 @@ struct ContentView: View {
         _ title: String,
         field: FileSortField,
         sort: Binding<FileSortOption>,
-        alignment: Alignment
+        alignment: Alignment,
+        onSort: @escaping () -> Void
     ) -> some View {
         Button {
             if sort.wrappedValue.field == field {
@@ -944,6 +951,7 @@ struct ContentView: View {
             } else {
                 sort.wrappedValue = FileSortOption(field: field, ascending: field == .name)
             }
+            onSort()
         } label: {
             HStack(spacing: 4) {
                 Text(title)
@@ -956,7 +964,7 @@ struct ContentView: View {
             .contentShape(Rectangle())
         }
         .buttonStyle(.plain)
-        .help("按\(title)排序；再次点击切换升降序")
+        .help("刷新当前列表并按\(title)排序；再次点击切换升降序")
     }
 
     private var visibleLocalEntries: [LocalEntry] {

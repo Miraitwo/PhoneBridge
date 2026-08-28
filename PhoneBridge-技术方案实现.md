@@ -1,6 +1,6 @@
 # PhoneBridge 技术方案与实现说明
 
-> 适用版本：PhoneBridge 0.15.0（Build 27）
+> 适用版本：PhoneBridge 0.15.5（Build 32）
 > 文档定位：架构设计、关键实现、构建发布、验证现状和后续演进
 > 目标平台：Apple Silicon macOS 13+
 
@@ -146,7 +146,7 @@ struct PhoneDevice: Identifiable, Hashable {
 }
 ```
 
-- Android `id` 使用 ADB serial；无线 ADB 时通常为 `IP:端口`。
+- Android 先把 ADB transport serial 作为命令路由 ID；无线 ADB 时通常为 `IP:端口`。发现阶段额外读取 `ro.serialno` / `ro.boot.serialno` 作为实体设备标识，同一实体同时存在 USB 与无线通道时仅保留 USB transport；无法读取硬件序列号时保持各通道独立，避免误合并。
 - iOS `id` 使用 ImageCaptureCore 设备 UUID。
 - 同一个 `id` 同时用于面板状态、传输路由和投屏选择。
 
@@ -330,7 +330,24 @@ adb -s <serial> push <local> <remoteDirectory>/<filename>
 
 ### 9.7 Android 无线连接
 
-界面分别调用：
+二维码配对遵循 Android Studio/AOSP 使用的格式：
+
+```text
+WIFI:T:ADB;S:studio-<10位随机服务名>;P:<12位随机密码>;;
+```
+
+端到端流程：
+
+1. PhoneBridge 使用 `SystemRandomNumberGenerator` 生成一次性 `studio-*` 服务名和密码，并通过 CoreImage 显示二维码。
+2. 手机在系统“无线调试 → 使用二维码配对设备”中扫码后，以相同服务名广播 `_adb-tls-pairing._tcp`。
+3. PhoneBridge 每 750ms 读取 `adb mdns services`，只匹配本次随机服务名，避免多人环境中串接其他设备。
+4. 找到配对端口后执行 `adb pair <endpoint> <随机密码>`，并从成功结果读取设备 GUID。
+5. 继续匹配 GUID 对应的 `_adb-tls-connect._tcp` 服务，必要时执行 `adb connect <最新连接端口>`。
+6. 设备在线后刷新主界面的多设备文件面板。
+
+二维码等待上限为 120 秒，配对后的自动连接等待上限为 30 秒；关闭窗口、停止或重新生成会取消旧任务。随机密码只存在于当前进程内，不写入 `UserDefaults` 或文档。
+
+手动备用入口分别调用：
 
 ```bash
 adb pair <IP:配对端口> <6位配对码>
@@ -338,7 +355,7 @@ adb connect <IP:连接端口>
 adb disconnect <IP:连接端口>
 ```
 
-配对成功不等于已建立可用设备连接，因此 UI 把“配对”和“连接”分成两个步骤。连接成功后重新刷新设备列表，后续浏览、pull、push 和 scrcpy 都通过 serial 复用无线通道。
+手动配对成功不等于已建立可用设备连接，因此备用 UI 仍把“配对”和“连接”分成两个步骤。连接成功后重新刷新设备列表，后续浏览、pull、push 和 scrcpy 都通过 serial 复用无线通道。
 
 ## 10. iOS 媒体方案
 
@@ -624,7 +641,7 @@ scrcpy \
 
 - 同一设备只启动一个窗口。
 - 多台 Android 可各自运行窗口。
-- USB 和无线 ADB 使用相同设备 ID 路由。
+- ADB 发现层按硬件序列号合并同一手机的 USB 与无线通道，并优先把 USB transport 作为文件和 scrcpy 路由；不同硬件序列号仍保留独立设备。
 - PhoneBridge 只启动 scrcpy 原生独立窗口，不再建立 Android 内嵌采集通道。
 
 独立窗口由 scrcpy 直接解码和渲染，保留最低延迟、键鼠控制、剪贴板与拖放能力。PhoneBridge 右侧投屏栏仅承担启动、停止、截屏和录屏控制，不复制显示 Android 画面。
@@ -758,7 +775,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 
 截屏使用 `NSBitmapImageRep` 输出 PNG。录屏使用 `AVAssetWriter`、`AVAssetWriterInputPixelBufferAdaptor` 和 H.264 编码；按原始宽高比缩放到最长边不超过 1920 像素的偶数尺寸，空余区域使用黑色填充，时间戳采用实际录制时长而非固定帧序号。
 
-录制先写入系统临时目录，结束并成功封装 MP4 后再弹出 `NSSavePanel`。默认名称包含录制结束时间，用户可修改文件名和保存目录；取消时保留临时文件，并在工具栏显示“保存录像”，成功移动或替换目标文件后才清除待保存状态。保存面板的初始目录由 `PhoneBridge.lastMirrorCaptureDirectory` 恢复。只有需要抓取 scrcpy 窗口的 Android 独立模式依赖 macOS 屏幕录制权限，直接读取投屏帧的模式不额外申请权限。
+录制先写入系统临时目录，结束并成功封装 MP4 后再以主窗口 sheet 形式弹出 `NSSavePanel`。默认名称包含录制结束时间，用户可修改文件名和保存目录；取消时在同一宿主窗口显示二次确认。“返回保存”会重新打开保存 sheet，“放弃录像”调用 `discardPendingRecording()` 删除临时 MP4 并清空待保存状态；删除失败时继续保留并提示错误。保存面板的初始目录由 `PhoneBridge.lastMirrorCaptureDirectory` 恢复。只有需要抓取 scrcpy 窗口的 Android 独立模式依赖 macOS 屏幕录制权限，直接读取投屏帧的模式不额外申请权限。
 
 ## 17. 配置持久化
 
@@ -867,7 +884,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 生成：
 
 ```text
-dist/PhoneBridge-0.15.0-AppleSilicon.dmg
+dist/PhoneBridge-0.15.2-AppleSilicon.dmg
 ```
 
 DMG 包含：
@@ -936,10 +953,10 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 
 ### 22.1 已完成验证
 
-- PhoneBridge 0.15.0 Release 编译通过，无 Swift 编译警告。
+- PhoneBridge 0.15.2 Release 编译通过，无 Swift 编译警告。
 - 主程序为 arm64 Mach-O。
 - DMG 创建、CRC 校验和只读挂载通过。
-- 当前源码和本地 App 版本为 0.15.0，Build 27；DMG/流水线发布待完成。
+- 当前源码和已校验 DMG 版本为 0.15.2，Build 29；本地 App 已安装，GitHub 流水线发布待后续推送。
 - DMG 内 App 深度签名校验通过。
 - UxPlay、GStreamer、scrcpy、ADB 已封装。
 - UxPlay 启动检查所需的 `libav`、`autodetect` 插件及递归动态库已封装；使用包内运行环境启动后未再立即以插件缺失退出。
@@ -965,6 +982,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 
 - Android USB pull/push 的更多机型覆盖。
 - Android 11+ 无线配对、连接、断开和重连。
+- Android 系统二维码配对的不同品牌机型、Android 版本和现场 mDNS 网络覆盖。
 - 多台 Android / iPhone 同时连接和面板拖动排序。
 - 多台 Android 同时 scrcpy。
 - 多台 iPhone 同时启动 UxPlay、分别连接、内嵌切换和独立窗口并行显示。
@@ -985,6 +1003,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 | iOS ImageCaptureCore 偶发未收到首次发现回调 | 刷新无设备 | 刷新时重启 discovery，并给出解锁/信任提示 |
 | iCloud 优化导致原片不在本地 | 媒体不可立即下载 | 文档提示，依赖 iOS 下载原件 |
 | 公司 Wi-Fi 屏蔽 Bonjour/mDNS | 找不到 AirPlay 接收器 | 提供附近设备 AWDL 模式 |
+| 公司 Wi-Fi 屏蔽 ADB mDNS | Android 扫码后一直等待 | 提供 6 位配对码和地址手动连接备用入口 |
 | JPEG 内嵌管线资源占用高 | 高帧率卡顿、发热 | 三档画质，显示实测分辨率和 fps |
 | 本地 HTTP 无 TLS | 局域网监听风险 | 随机令牌、窗口关闭即停止、禁止公网使用 |
 | ad-hoc 签名未公证 | 首次启动被 Gatekeeper 拦截 | DMG 提供右键打开说明 |

@@ -165,6 +165,16 @@ final class MirrorCaptureService: ObservableObject {
         pendingRecordingFilename = nil
     }
 
+    func discardPendingRecording() throws {
+        guard let recordingURL = pendingRecordingURL else { return }
+        if FileManager.default.fileExists(atPath: recordingURL.path) {
+            try FileManager.default.removeItem(at: recordingURL)
+        }
+        pendingRecordingURL = nil
+        pendingRecordingFilename = nil
+        onStatus?("已放弃本次录屏。")
+    }
+
     private func prepareWriter(firstFrame: CGImage) throws {
         let size = Self.recordingSize(for: firstFrame)
         outputWidth = size.width

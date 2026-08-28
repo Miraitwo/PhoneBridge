@@ -10,6 +10,7 @@ struct WirelessConnectionView: View {
     @State private var connectionEndpoint = ""
     @State private var iPhoneReceiverName = ""
     @State private var isWorking = false
+    @State private var isManualAndroidPairingExpanded = false
 
     var body: some View {
         VStack(spacing: 0) {
@@ -107,43 +108,104 @@ struct WirelessConnectionView: View {
 
                     GroupBox("Android 无线调试") {
                         VStack(alignment: .leading, spacing: 12) {
-                            Text("Android 11 及以上：设置 → 开发者选项 → 无线调试 → 使用配对码配对设备。配对端口和连接端口通常不同。")
+                            Text("扫码配对（推荐）")
+                                .font(.headline)
+                            Text("Android 11 及以上：在手机上打开“设置 → 开发者选项 → 无线调试 → 使用二维码配对设备”，扫描下方二维码后会自动配对并连接。")
                                 .font(.callout)
                                 .foregroundStyle(.secondary)
 
-                            Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 10) {
-                                GridRow {
-                                    Text("配对地址")
-                                    TextField("例如 192.168.1.20:37123", text: $pairingEndpoint)
-                                }
-                                GridRow {
-                                    Text("6 位配对码")
-                                    TextField("例如 123456", text: $pairingCode)
-                                }
-                            }
+                            if let request = model.androidQRPairingRequest {
+                                HStack(alignment: .top, spacing: 18) {
+                                    QRCodeView(text: request.payload)
+                                        .frame(width: 190, height: 190)
+                                        .padding(10)
+                                        .background(.white, in: RoundedRectangle(cornerRadius: 12))
+                                        .overlay {
+                                            RoundedRectangle(cornerRadius: 12)
+                                                .stroke(Color.secondary.opacity(0.25))
+                                        }
 
-                            Button("配对") {
-                                run {
-                                    await model.pairAndroidWirelessly(endpoint: pairingEndpoint, code: pairingCode)
+                                    VStack(alignment: .leading, spacing: 12) {
+                                        Label(model.androidQRPairingStatus, systemImage: androidQRPairingStatusSymbol)
+                                            .font(.callout)
+                                            .foregroundStyle(model.isAndroidQRPairing ? Color.primary : Color.secondary)
+                                            .fixedSize(horizontal: false, vertical: true)
+
+                                        if model.isAndroidQRPairing {
+                                            ProgressView()
+                                                .controlSize(.small)
+                                        }
+
+                                        Text("二维码为一次性随机凭据，有效等待时间约 2 分钟。手机和 Mac 需要处于同一局域网。")
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+
+                                        HStack {
+                                            Button(model.isAndroidQRPairing ? "重新生成二维码" : "生成新二维码") {
+                                                model.startAndroidQRPairing()
+                                            }
+                                            .buttonStyle(.borderedProminent)
+
+                                            if model.isAndroidQRPairing {
+                                                Button("停止") {
+                                                    model.cancelAndroidQRPairing(clearRequest: false)
+                                                }
+                                                .buttonStyle(.bordered)
+                                            }
+                                        }
+                                    }
+                                    .frame(maxWidth: .infinity, alignment: .leading)
                                 }
+                            } else {
+                                Button {
+                                    model.startAndroidQRPairing()
+                                } label: {
+                                    Label("生成配对二维码", systemImage: "qrcode")
+                                }
+                                .buttonStyle(.borderedProminent)
                             }
-                            .buttonStyle(.bordered)
-                            .disabled(isWorking)
 
                             Divider()
 
-                            HStack {
-                                TextField("连接地址，例如 192.168.1.20:42817", text: $connectionEndpoint)
-                                Button("连接") {
-                                    run { await model.connectAndroidWirelessly(endpoint: connectionEndpoint) }
+                            DisclosureGroup("手动配对与连接（备用）", isExpanded: $isManualAndroidPairingExpanded) {
+                                VStack(alignment: .leading, spacing: 12) {
+                                    Text("配对端口和连接端口通常不同。扫码不可用时，可使用手机显示的 6 位配对码和地址。")
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+
+                                    Grid(alignment: .leading, horizontalSpacing: 10, verticalSpacing: 10) {
+                                        GridRow {
+                                            Text("配对地址")
+                                            TextField("例如 192.168.1.20:37123", text: $pairingEndpoint)
+                                        }
+                                        GridRow {
+                                            Text("6 位配对码")
+                                            TextField("例如 123456", text: $pairingCode)
+                                        }
+                                    }
+
+                                    Button("配对") {
+                                        run {
+                                            await model.pairAndroidWirelessly(endpoint: pairingEndpoint, code: pairingCode)
+                                        }
+                                    }
+                                    .buttonStyle(.bordered)
+                                    .disabled(isWorking)
+
+                                    HStack {
+                                        TextField("连接地址，例如 192.168.1.20:42817", text: $connectionEndpoint)
+                                        Button("连接") {
+                                            run { await model.connectAndroidWirelessly(endpoint: connectionEndpoint) }
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                        Button("断开") {
+                                            run { await model.disconnectAndroidWirelessly(endpoint: connectionEndpoint) }
+                                        }
+                                        .buttonStyle(.bordered)
+                                    }
+                                    .disabled(isWorking)
                                 }
-                                .buttonStyle(.borderedProminent)
-                                Button("断开") {
-                                    run { await model.disconnectAndroidWirelessly(endpoint: connectionEndpoint) }
-                                }
-                                .buttonStyle(.bordered)
                             }
-                            .disabled(isWorking)
                         }
                         .padding(6)
                     }
@@ -168,11 +230,20 @@ struct WirelessConnectionView: View {
         .onAppear {
             iPhoneReceiverName = model.iPhoneAirPlayName
         }
+        .onDisappear {
+            model.cancelAndroidQRPairing()
+        }
     }
 
     private func applyIPhoneReceiverName() {
         model.selectWirelessIPhoneMirrorTarget()
         iPhoneReceiverName = model.setIPhoneAirPlayName(iPhoneReceiverName)
+    }
+
+    private var androidQRPairingStatusSymbol: String {
+        if model.isAndroidQRPairing { return "qrcode.viewfinder" }
+        if model.androidQRPairingStatus.contains("成功") { return "checkmark.circle" }
+        return "exclamationmark.triangle"
     }
 
     private func run(_ operation: @escaping () async -> Void) {

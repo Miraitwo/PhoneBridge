@@ -4,7 +4,34 @@ import ImageIO
 import UniformTypeIdentifiers
 
 final class AndroidADBService {
+    struct QRPairingRequest: Equatable {
+        let serviceName: String
+        let password: String
+
+        var payload: String {
+            "WIFI:T:ADB;S:\(serviceName);P:\(password);;"
+        }
+    }
+
+    struct MDNSService: Equatable {
+        enum Kind: Equatable {
+            case pairing
+            case connection
+        }
+
+        let name: String
+        let kind: Kind
+        let endpoint: String
+    }
+
+    struct DeviceTransport {
+        let id: String
+        let device: PhoneDevice
+        let isUSB: Bool
+    }
+
     private(set) var adbURL: URL?
+    private var physicalSerialByTransportID: [String: String] = [:]
 
     init() {
         adbURL = Self.findADB()
@@ -12,6 +39,15 @@ final class AndroidADBService {
 
     func refreshADBLocation() {
         adbURL = Self.findADB()
+    }
+
+    static func makeQRPairingRequest() -> QRPairingRequest {
+        var generator = SystemRandomNumberGenerator()
+        let serviceAlphabet = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-")
+        let passwordAlphabet = Array("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-+*/<>{}")
+        let serviceSuffix = String((0..<10).compactMap { _ in serviceAlphabet.randomElement(using: &generator) })
+        let password = String((0..<12).compactMap { _ in passwordAlphabet.randomElement(using: &generator) })
+        return QRPairingRequest(serviceName: "studio-\(serviceSuffix)", password: password)
     }
 
     func pair(endpoint: String, code: String) async throws -> String {
@@ -33,11 +69,169 @@ final class AndroidADBService {
             executable: adbURL,
             arguments: ["connect", endpoint]
         )
-        guard result.exitCode == 0 else {
+        let output = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard result.exitCode == 0, Self.isSuccessfulADBConnectOutput(output) else {
             throw PhoneBridgeError.commandFailed(Self.bestError(from: result))
         }
-        let output = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
         return output.isEmpty ? "已连接无线 Android。" : output
+    }
+
+    func pairUsingQRCode(
+        request: QRPairingRequest,
+        pairingTimeout: TimeInterval = 120,
+        connectionTimeout: TimeInterval = 30,
+        onStatus: @escaping (String) -> Void
+    ) async throws -> String {
+        guard let adbURL else { throw PhoneBridgeError.adbNotFound }
+        onStatus("正在启动 Android 调试服务…")
+        let startServer = try await ProcessRunner.run(executable: adbURL, arguments: ["start-server"])
+        guard startServer.exitCode == 0 else {
+            throw PhoneBridgeError.commandFailed(Self.bestError(from: startServer))
+        }
+
+        let support = try await ProcessRunner.run(executable: adbURL, arguments: ["mdns", "check"])
+        guard support.exitCode == 0 else {
+            throw PhoneBridgeError.commandFailed(Self.bestError(from: support))
+        }
+
+        let bonjourDiscovery = await MainActor.run { BonjourADBDiscovery() }
+        await MainActor.run { bonjourDiscovery.start() }
+        defer {
+            Task { @MainActor in
+                bonjourDiscovery.stop()
+            }
+        }
+
+        onStatus("ADB 已就绪，请用手机扫描二维码…")
+
+        let pairingStartedAt = Date()
+        let pairingDeadline = Date().addingTimeInterval(pairingTimeout)
+        var pairingService: MDNSService?
+        var lastReportedBucket = -1
+        var lastUSBAssistedCheck = Date.distantPast
+        while Date() < pairingDeadline {
+            try Task.checkCancellation()
+            let services = await discoveredServices(
+                adbURL: adbURL,
+                bonjourDiscovery: bonjourDiscovery
+            )
+            if let match = services.first(where: {
+                $0.kind == .pairing && $0.name == request.serviceName
+            }) {
+                pairingService = match
+                break
+            }
+
+            if Date().timeIntervalSince(lastUSBAssistedCheck) >= 1.5 {
+                lastUSBAssistedCheck = Date()
+                if let service = await usbAssistedService(
+                    named: request.serviceName,
+                    kind: .pairing,
+                    adbURL: adbURL
+                ) {
+                    pairingService = service
+                    onStatus("已通过数据线找到手机配对端口，正在继续安全配对…")
+                    break
+                }
+            }
+
+            if let failure = await MainActor.run(body: { bonjourDiscovery.failureDescription }) {
+                throw PhoneBridgeError.commandFailed(failure)
+            }
+
+            let elapsed = Int(Date().timeIntervalSince(pairingStartedAt))
+            let bucket = elapsed / 5
+            if elapsed >= 5, bucket != lastReportedBucket {
+                lastReportedBucket = bucket
+                onStatus("正在等待手机发布配对服务…（已等待 \(elapsed) 秒）")
+            }
+            try await Task.sleep(nanoseconds: 750_000_000)
+        }
+
+        guard let pairingService else {
+            throw PhoneBridgeError.commandFailed(
+                "没有发现手机的无线配对服务。请确认手机和 Mac 在同一网络、PhoneBridge 已获“本地网络”权限；公司或访客 Wi-Fi 隔离设备时，请改用同一手机热点或下方手动配对。"
+            )
+        }
+
+        onStatus("已检测到手机，正在完成安全配对…")
+        let pairingResult = try await ProcessRunner.run(
+            executable: adbURL,
+            arguments: ["pair", pairingService.endpoint, request.password]
+        )
+        guard pairingResult.exitCode == 0 else {
+            throw PhoneBridgeError.commandFailed(Self.bestError(from: pairingResult))
+        }
+
+        let pairingOutput = pairingResult.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard pairingOutput.localizedCaseInsensitiveContains("successfully paired") else {
+            throw PhoneBridgeError.commandFailed(pairingOutput.isEmpty ? "扫码配对没有返回成功结果。" : pairingOutput)
+        }
+
+        onStatus("扫码配对成功，正在自动建立无线连接…")
+        let guid = Self.pairingGUID(from: pairingOutput)
+        let pairingHost = Self.host(fromADBEndpoint: pairingService.endpoint)
+        let connectionDeadline = Date().addingTimeInterval(connectionTimeout)
+        var usbConnectionService: MDNSService?
+        var usbConnectionCandidates: [MDNSService] = []
+        var lastUSBConnectionCheck = Date.distantPast
+        var lastConnectionAttemptByEndpoint: [String: Date] = [:]
+
+        while Date() < connectionDeadline {
+            try Task.checkCancellation()
+            if try await isWirelessDeviceOnline(guid: guid, host: pairingHost, adbURL: adbURL) {
+                return "Android 扫码配对并连接成功。"
+            }
+
+            var services = await discoveredServices(
+                adbURL: adbURL,
+                bonjourDiscovery: bonjourDiscovery
+            )
+            if let guid,
+               Date().timeIntervalSince(lastUSBConnectionCheck) >= 1.5 {
+                lastUSBConnectionCheck = Date()
+                usbConnectionService = await usbAssistedService(
+                    named: guid,
+                    kind: .connection,
+                    adbURL: adbURL
+                )
+                usbConnectionCandidates = await usbAssistedConnectionServices(
+                    named: guid,
+                    adbURL: adbURL
+                )
+            }
+            if let usbConnectionService {
+                services.append(usbConnectionService)
+            }
+            services.append(contentsOf: usbConnectionCandidates)
+            let matchingServices = services.filter { service in
+                guard service.kind == .connection else { return false }
+                if let guid, service.name == guid { return true }
+                if let pairingHost {
+                    return Self.host(fromADBEndpoint: service.endpoint) == pairingHost
+                }
+                return false
+            }
+            for connectionService in matchingServices {
+                let lastAttempt = lastConnectionAttemptByEndpoint[connectionService.endpoint]
+                guard lastAttempt == nil || Date().timeIntervalSince(lastAttempt!) >= 3 else {
+                    continue
+                }
+                lastConnectionAttemptByEndpoint[connectionService.endpoint] = Date()
+                if let connectResult = try? await ProcessRunner.run(
+                    executable: adbURL,
+                    arguments: ["connect", connectionService.endpoint]
+                ) {
+                    let output = connectResult.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+                    if connectResult.exitCode == 0, Self.isSuccessfulADBConnectOutput(output) {
+                        onStatus("已找到无线连接端口，正在等待设备上线…")
+                    }
+                }
+            }
+            try await Task.sleep(nanoseconds: 750_000_000)
+        }
+
+        return "Android 扫码配对成功；无线连接仍在系统后台建立，请保持无线调试开启并刷新设备。"
     }
 
     func disconnect(endpoint: String) async throws -> String {
@@ -97,13 +291,43 @@ final class AndroidADBService {
         )
     }
 
+    @MainActor
     func devices() async throws -> [PhoneDevice] {
         guard let adbURL else { throw PhoneBridgeError.adbNotFound }
         let result = try await ProcessRunner.run(executable: adbURL, arguments: ["devices", "-l"])
         guard result.exitCode == 0 else {
             throw PhoneBridgeError.commandFailed(Self.bestError(from: result))
         }
-        return Self.parseDevices(result.standardOutput)
+        let transports = Self.parseDeviceTransports(result.standardOutput)
+        let activeTransportIDs = Set(transports.map(\.id))
+        physicalSerialByTransportID = physicalSerialByTransportID.filter {
+            activeTransportIDs.contains($0.key)
+        }
+
+        for transport in transports where physicalSerialByTransportID[transport.id] == nil {
+            if let physicalSerial = await physicalSerial(for: transport.id, adbURL: adbURL) {
+                physicalSerialByTransportID[transport.id] = physicalSerial
+            }
+        }
+
+        return Self.deduplicatedDevices(
+            transports: transports,
+            physicalSerials: physicalSerialByTransportID
+        )
+    }
+
+    private func physicalSerial(for transportID: String, adbURL: URL) async -> String? {
+        for property in ["ro.serialno", "ro.boot.serialno"] {
+            guard let result = try? await ProcessRunner.run(
+                executable: adbURL,
+                arguments: ["-s", transportID, "shell", "getprop", property]
+            ), result.exitCode == 0 else { continue }
+            let serial = result.standardOutput.trimmingCharacters(in: .whitespacesAndNewlines)
+            if !serial.isEmpty, serial.lowercased() != "unknown" {
+                return serial
+            }
+        }
+        return nil
     }
 
     func entries(deviceID: String, at remotePath: String) async throws -> [RemoteEntry] {
@@ -272,7 +496,7 @@ final class AndroidADBService {
         }
     }
 
-    static func parseDevices(_ output: String) -> [PhoneDevice] {
+    static func parseDeviceTransports(_ output: String) -> [DeviceTransport] {
         output
             .split(whereSeparator: \Character.isNewline)
             .dropFirst()
@@ -287,8 +511,245 @@ final class AndroidADBService {
                 })
                 let model = attributes["model"]?.replacingOccurrences(of: "_", with: " ") ?? "Android 手机"
                 let product = attributes["product"] ?? serial
-                return PhoneDevice(id: serial, name: model, platform: .android, detail: product)
+                let device = PhoneDevice(id: serial, name: model, platform: .android, detail: product)
+                return DeviceTransport(id: serial, device: device, isUSB: attributes["usb"] != nil)
             }
+    }
+
+    static func parseDevices(_ output: String) -> [PhoneDevice] {
+        parseDeviceTransports(output).map(\.device)
+    }
+
+    static func parseMDNSServices(_ output: String) -> [MDNSService] {
+        output
+            .split(whereSeparator: \Character.isNewline)
+            .compactMap { rawLine -> MDNSService? in
+                let columns = rawLine.split(whereSeparator: \Character.isWhitespace).map(String.init)
+                guard columns.count >= 3 else { return nil }
+                let kind: MDNSService.Kind
+                switch columns[1].trimmingCharacters(in: CharacterSet(charactersIn: ".")) {
+                case "_adb-tls-pairing._tcp": kind = .pairing
+                case "_adb-tls-connect._tcp": kind = .connection
+                default: return nil
+                }
+                return MDNSService(name: columns[0], kind: kind, endpoint: columns[2])
+            }
+    }
+
+    static func pairingGUID(from output: String) -> String? {
+        guard let start = output.range(of: "[guid=")?.upperBound,
+              let end = output[start...].firstIndex(of: "]") else { return nil }
+        let guid = String(output[start..<end]).trimmingCharacters(in: .whitespacesAndNewlines)
+        return guid.isEmpty ? nil : guid
+    }
+
+    static func advertisedServicePort(
+        from serviceDiscoveryDump: String,
+        name: String,
+        kind: MDNSService.Kind
+    ) -> Int? {
+        let serviceType: String
+        switch kind {
+        case .pairing: serviceType = "_adb-tls-pairing._tcp"
+        case .connection: serviceType = "_adb-tls-connect._tcp"
+        }
+
+        let fullName = "\(name).\(serviceType)"
+        guard serviceDiscoveryDump.contains("Advertiser: serviceFullName=\(fullName)") else {
+            return nil
+        }
+
+        let escapedName = NSRegularExpression.escapedPattern(for: name)
+        let escapedType = NSRegularExpression.escapedPattern(for: serviceType)
+        let pattern = "Adding service name:\\s*\(escapedName),\\s*type:\\s*\(escapedType),[^\\n]*port:\\s*([0-9]+)"
+        guard let regex = try? NSRegularExpression(pattern: pattern) else { return nil }
+        let range = NSRange(serviceDiscoveryDump.startIndex..., in: serviceDiscoveryDump)
+        guard let match = regex.matches(in: serviceDiscoveryDump, range: range).last,
+              let portRange = Range(match.range(at: 1), in: serviceDiscoveryDump),
+              let port = Int(serviceDiscoveryDump[portRange]),
+              (1...65_535).contains(port) else { return nil }
+        return port
+    }
+
+    static func wirelessIPv4(from interfaceOutput: String) -> String? {
+        let pattern = "\\binet\\s+([0-9]{1,3}(?:\\.[0-9]{1,3}){3})/"
+        guard let regex = try? NSRegularExpression(pattern: pattern),
+              let match = regex.firstMatch(
+                in: interfaceOutput,
+                range: NSRange(interfaceOutput.startIndex..., in: interfaceOutput)
+              ),
+              let addressRange = Range(match.range(at: 1), in: interfaceOutput) else { return nil }
+        return String(interfaceOutput[addressRange])
+    }
+
+    static func candidateWirelessADBPorts(from socketOutput: String) -> [Int] {
+        var seen = Set<Int>()
+        return socketOutput
+            .split(whereSeparator: \Character.isNewline)
+            .compactMap { rawLine -> Int? in
+                let columns = rawLine.split(whereSeparator: \Character.isWhitespace).map(String.init)
+                guard columns.count >= 4, columns[0] == "LISTEN" else { return nil }
+                let localAddress = columns[3]
+                guard !localAddress.hasPrefix("127."),
+                      !localAddress.hasPrefix("[::1]"),
+                      let separator = localAddress.lastIndex(of: ":"),
+                      let port = Int(localAddress[localAddress.index(after: separator)...]),
+                      (30_000...65_535).contains(port),
+                      seen.insert(port).inserted else { return nil }
+                return port
+            }
+    }
+
+    static func isSuccessfulADBConnectOutput(_ output: String) -> Bool {
+        output.localizedCaseInsensitiveContains("connected to") ||
+            output.localizedCaseInsensitiveContains("already connected")
+    }
+
+    static func deduplicatedDevices(
+        transports: [DeviceTransport],
+        physicalSerials: [String: String]
+    ) -> [PhoneDevice] {
+        var groupOrder: [String] = []
+        var selectedByGroup: [String: DeviceTransport] = [:]
+
+        for transport in transports {
+            let physicalSerial = physicalSerials[transport.id]?
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            let groupID: String
+            if let physicalSerial, !physicalSerial.isEmpty {
+                groupID = "physical|\(physicalSerial.lowercased())"
+            } else {
+                groupID = "transport|\(transport.id)"
+            }
+
+            if selectedByGroup[groupID] == nil {
+                groupOrder.append(groupID)
+                selectedByGroup[groupID] = transport
+            } else if transport.isUSB, selectedByGroup[groupID]?.isUSB == false {
+                selectedByGroup[groupID] = transport
+            }
+        }
+
+        return groupOrder.compactMap { selectedByGroup[$0]?.device }
+    }
+
+    private func mdnsServices(adbURL: URL) async throws -> [MDNSService] {
+        let result = try await ProcessRunner.run(executable: adbURL, arguments: ["mdns", "services"])
+        guard result.exitCode == 0 else {
+            throw PhoneBridgeError.commandFailed(Self.bestError(from: result))
+        }
+        return Self.parseMDNSServices(result.standardOutput)
+    }
+
+    private func discoveredServices(
+        adbURL: URL,
+        bonjourDiscovery: BonjourADBDiscovery
+    ) async -> [MDNSService] {
+        let adbServices = (try? await mdnsServices(adbURL: adbURL)) ?? []
+        let bonjourServices = await MainActor.run { bonjourDiscovery.services }
+        var seen = Set<String>()
+        return (adbServices + bonjourServices).filter { service in
+            let key = "\(service.name.lowercased())|\(service.endpoint.lowercased())"
+            return seen.insert(key).inserted
+        }
+    }
+
+    private func usbAssistedService(
+        named serviceName: String,
+        kind: MDNSService.Kind,
+        adbURL: URL
+    ) async -> MDNSService? {
+        guard let devicesResult = try? await ProcessRunner.run(
+            executable: adbURL,
+            arguments: ["devices", "-l"]
+        ), devicesResult.exitCode == 0 else { return nil }
+
+        let usbTransports = Self.parseDeviceTransports(devicesResult.standardOutput).filter(\.isUSB)
+        for transport in usbTransports {
+            if Task.isCancelled { return nil }
+            guard let discoveryResult = try? await ProcessRunner.run(
+                executable: adbURL,
+                arguments: ["-s", transport.id, "shell", "dumpsys", "servicediscovery"]
+            ), discoveryResult.exitCode == 0,
+            let port = Self.advertisedServicePort(
+                from: discoveryResult.standardOutput,
+                name: serviceName,
+                kind: kind
+            ),
+            let interfaceResult = try? await ProcessRunner.run(
+                executable: adbURL,
+                arguments: ["-s", transport.id, "shell", "ip", "-4", "addr", "show", "wlan0"]
+            ), interfaceResult.exitCode == 0,
+            let host = Self.wirelessIPv4(from: interfaceResult.standardOutput) else { continue }
+
+            return MDNSService(
+                name: serviceName,
+                kind: kind,
+                endpoint: "\(host):\(port)"
+            )
+        }
+        return nil
+    }
+
+    private func usbAssistedConnectionServices(
+        named serviceName: String,
+        adbURL: URL
+    ) async -> [MDNSService] {
+        guard let devicesResult = try? await ProcessRunner.run(
+            executable: adbURL,
+            arguments: ["devices", "-l"]
+        ), devicesResult.exitCode == 0 else { return [] }
+
+        var services: [MDNSService] = []
+        let usbTransports = Self.parseDeviceTransports(devicesResult.standardOutput).filter(\.isUSB)
+        for transport in usbTransports {
+            if Task.isCancelled { return [] }
+            guard let interfaceResult = try? await ProcessRunner.run(
+                executable: adbURL,
+                arguments: ["-s", transport.id, "shell", "ip", "-4", "addr", "show", "wlan0"]
+            ), interfaceResult.exitCode == 0,
+            let host = Self.wirelessIPv4(from: interfaceResult.standardOutput),
+            let socketResult = try? await ProcessRunner.run(
+                executable: adbURL,
+                arguments: ["-s", transport.id, "shell", "ss", "-ltn"]
+            ), socketResult.exitCode == 0 else { continue }
+
+            services.append(contentsOf: Self.candidateWirelessADBPorts(from: socketResult.standardOutput).map { port in
+                MDNSService(
+                    name: serviceName,
+                    kind: .connection,
+                    endpoint: "\(host):\(port)"
+                )
+            })
+        }
+        return services
+    }
+
+    private func isWirelessDeviceOnline(guid: String?, host: String?, adbURL: URL) async throws -> Bool {
+        let result = try await ProcessRunner.run(executable: adbURL, arguments: ["devices"])
+        guard result.exitCode == 0 else {
+            throw PhoneBridgeError.commandFailed(Self.bestError(from: result))
+        }
+        return result.standardOutput
+            .split(whereSeparator: \Character.isNewline)
+            .dropFirst()
+            .contains { rawLine in
+                let columns = rawLine.split(whereSeparator: \Character.isWhitespace).map(String.init)
+                guard columns.count >= 2, columns[1] == "device" else { return false }
+                let transportID = columns[0]
+                if let guid, transportID.hasPrefix(guid) { return true }
+                if let host, transportID.hasPrefix("\(host):") { return true }
+                return false
+            }
+    }
+
+    private static func host(fromADBEndpoint endpoint: String) -> String? {
+        if endpoint.hasPrefix("["), let closingBracket = endpoint.firstIndex(of: "]") {
+            return String(endpoint[endpoint.index(after: endpoint.startIndex)..<closingBracket])
+        }
+        guard let separator = endpoint.lastIndex(of: ":") else { return nil }
+        let host = String(endpoint[..<separator])
+        return host.isEmpty ? nil : host
     }
 
     static func parseDirectoryListing(_ output: String, deviceID: String) -> [RemoteEntry] {

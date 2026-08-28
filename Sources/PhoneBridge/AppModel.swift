@@ -50,6 +50,9 @@ final class AppModel: ObservableObject {
     @Published var iPhonePeerToPeerEnabled: Bool
     @Published private(set) var iPhonePeerToPeerPIN: String
     @Published var iPhoneMirrorMode: IPhoneMirrorMode
+    @Published private(set) var androidQRPairingRequest: AndroidADBService.QRPairingRequest?
+    @Published private(set) var androidQRPairingStatus = "点击生成二维码后，用手机的“使用二维码配对设备”功能扫描。"
+    @Published private(set) var isAndroidQRPairing = false
     @Published private(set) var mirrorTargetID: String?
     @Published private(set) var activeIPhoneMirrorSessionIDs = Set<String>()
 
@@ -72,6 +75,7 @@ final class AppModel: ObservableObject {
     private var uploadRetryPayloads: [UUID: PendingUpload] = [:]
     private var uploadWorkerIsRunning = false
     private var activeAndroidTextReverse: (deviceID: String, port: Int)?
+    private var androidQRPairingTask: Task<Void, Never>?
     private let thumbnailCache = NSCache<NSString, NSData>()
     private var thumbnailLoads: [String: Task<Data?, Never>] = [:]
     private let androidThumbnailLimiter = AndroidThumbnailLimiter(limit: 2)
@@ -692,6 +696,61 @@ final class AppModel: ObservableObject {
         }
     }
 
+    func startAndroidQRPairing() {
+        androidQRPairingTask?.cancel()
+        let request = AndroidADBService.makeQRPairingRequest()
+        androidQRPairingRequest = request
+        androidQRPairingStatus = "等待手机扫描二维码…"
+        statusMessage = "Android 扫码配对已启动。"
+        isAndroidQRPairing = true
+
+        androidQRPairingTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                let result = try await self.androidService.pairUsingQRCode(
+                    request: request,
+                    onStatus: { [weak self] message in
+                        Task { @MainActor in
+                            guard let self, self.androidQRPairingRequest == request else { return }
+                            self.androidQRPairingStatus = message
+                            self.statusMessage = message
+                        }
+                    }
+                )
+                guard !Task.isCancelled, self.androidQRPairingRequest == request else { return }
+                self.androidQRPairingStatus = result
+                self.statusMessage = result
+                self.isAndroidQRPairing = false
+                self.androidQRPairingTask = nil
+                await self.refreshDevices(restartIOSDiscovery: false)
+            } catch is CancellationError {
+                guard self.androidQRPairingRequest == request else { return }
+                self.androidQRPairingStatus = "已停止扫码配对。"
+                self.isAndroidQRPairing = false
+                self.androidQRPairingTask = nil
+            } catch {
+                guard self.androidQRPairingRequest == request else { return }
+                let message = error.localizedDescription
+                self.androidQRPairingStatus = message
+                self.isAndroidQRPairing = false
+                self.androidQRPairingTask = nil
+                self.show(error)
+            }
+        }
+    }
+
+    func cancelAndroidQRPairing(clearRequest: Bool = true) {
+        androidQRPairingTask?.cancel()
+        androidQRPairingTask = nil
+        isAndroidQRPairing = false
+        if clearRequest {
+            androidQRPairingRequest = nil
+            androidQRPairingStatus = "点击生成二维码后，用手机的“使用二维码配对设备”功能扫描。"
+        } else {
+            androidQRPairingStatus = "已停止扫码配对。"
+        }
+    }
+
     func connectAndroidWirelessly(endpoint: String) async {
         let normalizedEndpoint = endpoint.trimmingCharacters(in: .whitespacesAndNewlines)
         guard isValidADBEndpoint(normalizedEndpoint) else {
@@ -800,6 +859,15 @@ final class AppModel: ObservableObject {
     }
 
     func savePendingMirrorRecording() {
+        guard mirrorCaptureService.pendingRecordingURL != nil else {
+            statusMessage = "没有待保存的录屏。"
+            return
+        }
+
+        presentPendingMirrorRecordingSavePanel()
+    }
+
+    private func presentPendingMirrorRecordingSavePanel() {
         guard let source = mirrorCaptureService.pendingRecordingURL else {
             statusMessage = "没有待保存的录屏。"
             return
@@ -815,11 +883,27 @@ final class AppModel: ObservableObject {
         panel.allowedContentTypes = [.mpeg4Movie]
         panel.directoryURL = lastMirrorCaptureDirectory()
         panel.nameFieldStringValue = preferredName
-        guard panel.runModal() == .OK, let destination = panel.url else {
-            statusMessage = "已保留本次录屏；点击“保存录像”可再次命名并选择位置。"
+
+        guard let hostWindow = phoneBridgeHostWindow() else {
+            guard panel.runModal() == .OK, let destination = panel.url else {
+                confirmDiscardPendingMirrorRecording(attachedTo: nil)
+                return
+            }
+            savePendingMirrorRecording(source: source, destination: destination)
             return
         }
 
+        panel.beginSheetModal(for: hostWindow) { [weak self] response in
+            guard let self else { return }
+            guard response == .OK, let destination = panel.url else {
+                self.confirmDiscardPendingMirrorRecording(attachedTo: hostWindow)
+                return
+            }
+            self.savePendingMirrorRecording(source: source, destination: destination)
+        }
+    }
+
+    private func savePendingMirrorRecording(source: URL, destination: URL) {
         do {
             if FileManager.default.fileExists(atPath: destination.path) {
                 _ = try FileManager.default.replaceItemAt(destination, withItemAt: source)
@@ -832,6 +916,47 @@ final class AppModel: ObservableObject {
         } catch {
             show(error)
         }
+    }
+
+    private func confirmDiscardPendingMirrorRecording(attachedTo hostWindow: NSWindow?) {
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = "要放弃这次录屏吗？"
+        alert.informativeText = "放弃后，尚未保存的录像将被删除且无法恢复。"
+        alert.addButton(withTitle: "返回保存")
+        alert.addButton(withTitle: "放弃录像")
+
+        let handleResponse: (NSApplication.ModalResponse) -> Void = { [weak self] response in
+            guard let self else { return }
+            if response == .alertFirstButtonReturn {
+                self.presentPendingMirrorRecordingSavePanel()
+                return
+            }
+            guard response == .alertSecondButtonReturn else { return }
+            do {
+                try self.mirrorCaptureService.discardPendingRecording()
+                self.statusMessage = "已放弃本次录屏。"
+            } catch {
+                self.show(PhoneBridgeError.commandFailed(
+                    "无法删除临时录像，已继续保留：\(error.localizedDescription)"
+                ))
+            }
+        }
+
+        if let hostWindow {
+            alert.beginSheetModal(for: hostWindow, completionHandler: handleResponse)
+        } else {
+            handleResponse(alert.runModal())
+        }
+    }
+
+    private func phoneBridgeHostWindow() -> NSWindow? {
+        NSApp.windows.first {
+            $0.isVisible
+                && $0.canBecomeMain
+                && !($0 is NSPanel)
+                && !$0.title.contains("iPhone 投屏")
+        } ?? NSApp.mainWindow
     }
 
     private func currentMirrorCaptureSource() -> MirrorCaptureSource? {
