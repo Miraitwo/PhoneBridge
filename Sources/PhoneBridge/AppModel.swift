@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 
 @MainActor
 final class AppModel: ObservableObject {
+    static let wirelessIPhoneMirrorSessionID = "phonebridge-wireless-iphone"
     private static let lastLocalDirectoryKey = "PhoneBridge.lastLocalDirectory"
     private static let iPhoneMirrorQualityKey = "PhoneBridge.iPhoneMirrorQuality"
     private static let iPhoneAirPlayNameKey = "PhoneBridge.iPhoneAirPlayName"
@@ -49,17 +50,18 @@ final class AppModel: ObservableObject {
     @Published var iPhonePeerToPeerEnabled: Bool
     @Published private(set) var iPhonePeerToPeerPIN: String
     @Published var iPhoneMirrorMode: IPhoneMirrorMode
-    @Published private(set) var activeMirrorPlatform: PhonePlatform? = nil
+    @Published private(set) var mirrorTargetID: String?
+    @Published private(set) var activeIPhoneMirrorSessionIDs = Set<String>()
 
     let androidService = AndroidADBService()
     let iosService = IOSMediaService()
     let mirroringService = ScreenMirroringService()
-    let embeddedIPhoneMirrorService = EmbeddedIPhoneMirrorService()
     let mirrorCaptureService = MirrorCaptureService()
     let wirelessTransferService = WirelessTransferService()
-    private lazy var iPhoneMirrorWindowService = IPhoneMirrorWindowService(
-        mirrorService: embeddedIPhoneMirrorService
-    )
+    private let idleIPhoneMirrorService = EmbeddedIPhoneMirrorService()
+    private var iPhoneMirrorServices: [String: EmbeddedIPhoneMirrorService] = [:]
+    private var iPhoneMirrorWindowServices: [String: IPhoneMirrorWindowService] = [:]
+    private var activeIPhoneReceiverNames: [String: String] = [:]
 
     private var androidDevices: [PhoneDevice] = []
     private var deviceConnectionOrder: [String] = []
@@ -69,7 +71,6 @@ final class AppModel: ObservableObject {
     private var pendingUploads: [PendingUpload] = []
     private var uploadRetryPayloads: [UUID: PendingUpload] = [:]
     private var uploadWorkerIsRunning = false
-    private var activeAndroidMirrorDeviceID: String?
     private var activeAndroidTextReverse: (deviceID: String, port: Int)?
     private let thumbnailCache = NSCache<NSString, NSData>()
     private var thumbnailLoads: [String: Task<Data?, Never>] = [:]
@@ -125,19 +126,15 @@ final class AppModel: ObservableObject {
             self?.errorMessage = message
             self?.statusMessage = message
         }
-        mirroringService.onAndroidStopped = { [weak self] deviceID, _ in
-            guard let self, self.activeAndroidMirrorDeviceID == deviceID else { return }
-            self.activeAndroidMirrorDeviceID = nil
-            if self.activeMirrorPlatform == .android { self.activeMirrorPlatform = nil }
+        mirroringService.onAndroidStopped = { [weak self] _, _ in
+            self?.objectWillChange.send()
         }
-        mirroringService.onIPhoneStopped = { [weak self] _ in
+        mirroringService.onIPhoneStopped = { [weak self] sessionID, _ in
             guard let self else { return }
-            self.iPhoneMirrorWindowService.close()
-            self.embeddedIPhoneMirrorService.stop()
-            if self.activeMirrorPlatform == .ios { self.activeMirrorPlatform = nil }
-        }
-        embeddedIPhoneMirrorService.onStatus = { [weak self] message in
-            self?.statusMessage = message
+            self.iPhoneMirrorWindowServices[sessionID]?.close()
+            self.iPhoneMirrorServices[sessionID]?.stop()
+            self.activeIPhoneReceiverNames.removeValue(forKey: sessionID)
+            self.activeIPhoneMirrorSessionIDs.remove(sessionID)
         }
         mirrorCaptureService.onStatus = { [weak self] message in
             self?.statusMessage = message
@@ -183,6 +180,7 @@ final class AppModel: ObservableObject {
 
     func selectDevice(_ id: String?) {
         selectedDeviceID = id
+        mirrorTargetID = id
         guard let id, let device = devices.first(where: { $0.id == id }) else {
             remoteEntries = []
             return
@@ -518,9 +516,9 @@ final class AppModel: ObservableObject {
             errorMessage = "请先连接并选择一台手机。"
             return
         }
+        mirrorTargetID = device.id
         switch device.platform {
         case .android:
-            activeMirrorPlatform = .android
             startAndroidMirroring(device: device)
         case .ios:
             startIPhoneMirroring()
@@ -528,24 +526,15 @@ final class AppModel: ObservableObject {
     }
 
     private func startAndroidMirroring(device: PhoneDevice) {
-        guard mirroringService.startAndroid(device: device) != nil else {
-            if activeMirrorPlatform == .android { activeMirrorPlatform = nil }
-            return
-        }
-        activeAndroidMirrorDeviceID = device.id
+        guard mirroringService.startAndroid(device: device) != nil else { return }
+        objectWillChange.send()
     }
 
     func stopSelectedAndroidMirroring() {
         guard let deviceID = selectedDeviceID, selectedDevice?.platform == .android else { return }
         if mirrorCaptureService.isRecording { stopMirrorRecording() }
         mirroringService.stopAndroid(deviceID: deviceID)
-        if activeAndroidMirrorDeviceID == deviceID { activeAndroidMirrorDeviceID = nil }
-        if activeMirrorPlatform == .android { activeMirrorPlatform = nil }
         statusMessage = "正在停止 Android 投屏…"
-    }
-
-    func stopCurrentEmbeddedMirroring() {
-        stopIPhoneMirroring()
     }
 
     func openScreenRecordingSettings() {
@@ -554,54 +543,76 @@ final class AppModel: ObservableObject {
     }
 
     func startIPhoneMirroring(allowWithoutConnectedDevice: Bool = false) {
-        if !allowWithoutConnectedDevice,
-           selectedDevice?.platform != .ios,
-           activeMirrorPlatform != .ios {
+        let sessionID: String
+        if let targetID = mirrorTargetID,
+           devices.first(where: { $0.id == targetID })?.platform == .ios {
+            sessionID = targetID
+        } else if let selectedDevice, selectedDevice.platform == .ios {
+            sessionID = selectedDevice.id
+            mirrorTargetID = selectedDevice.id
+        } else if allowWithoutConnectedDevice {
+            sessionID = Self.wirelessIPhoneMirrorSessionID
+            mirrorTargetID = sessionID
+        } else {
             errorMessage = "请先选择 iPhone，或从“无线连接”直接启动 AirPlay 接收器。"
             return
         }
-        activeMirrorPlatform = .ios
-        if mirroringService.iPhoneAirPlayProcessID != nil {
-            stopIPhoneMirroring()
+
+        if mirroringService.iPhoneAirPlayProcessID(sessionID: sessionID) != nil {
+            stopIPhoneMirroring(sessionID: sessionID)
             Task { @MainActor [weak self] in
-                try? await Task.sleep(nanoseconds: 500_000_000)
-                self?.launchIPhoneAirPlay()
+                guard let self else { return }
+                for _ in 0..<30 {
+                    if self.mirroringService.iPhoneAirPlayProcessID(sessionID: sessionID) == nil {
+                        self.launchIPhoneAirPlay(sessionID: sessionID)
+                        return
+                    }
+                    try? await Task.sleep(nanoseconds: 100_000_000)
+                }
+                self.errorMessage = "旧的 AirPlay 接收器未能及时停止，请稍后重新点击启动。"
             }
             return
         }
-        launchIPhoneAirPlay()
+        launchIPhoneAirPlay(sessionID: sessionID)
     }
 
-    private func launchIPhoneAirPlay() {
-        embeddedIPhoneMirrorService.markStartingAirPlayReceiver()
-        guard let streamPort = embeddedIPhoneMirrorService.startFrameReceiver() else { return }
+    private func launchIPhoneAirPlay(sessionID: String) {
+        let services = ensureIPhoneMirrorSession(sessionID: sessionID)
+        let receiverName = iPhoneReceiverName(for: sessionID)
+        services.mirror.markStartingAirPlayReceiver()
+        guard let streamPort = services.mirror.startFrameReceiver() else { return }
         if iPhoneMirrorMode == .embedded {
-            iPhoneMirrorWindowService.close()
+            services.window.close()
         }
         guard mirroringService.startIPhoneAirPlay(
+            sessionID: sessionID,
             streamPort: streamPort,
             quality: iPhoneMirrorQuality,
-            receiverName: iPhoneAirPlayName,
+            receiverName: receiverName,
             mode: iPhoneMirrorMode,
             peerToPeer: iPhonePeerToPeerEnabled,
             pin: iPhonePeerToPeerEnabled ? iPhonePeerToPeerPIN : nil
         ) != nil else {
-            iPhoneMirrorWindowService.close()
-            embeddedIPhoneMirrorService.stop()
+            services.window.close()
+            services.mirror.stop()
             return
         }
+        activeIPhoneReceiverNames[sessionID] = receiverName
+        activeIPhoneMirrorSessionIDs.insert(sessionID)
         if iPhoneMirrorMode == .separateWindow {
-            iPhoneMirrorWindowService.show(receiverName: iPhoneAirPlayName)
+            services.window.show(receiverName: receiverName)
         }
     }
 
     func showIPhoneMirrorWindow() {
-        guard iPhoneMirrorMode == .separateWindow,
-              mirroringService.iPhoneAirPlayProcessID != nil else {
+        guard let sessionID = currentIPhoneMirrorSessionID,
+              mirroringService.iPhoneAirPlayMode(sessionID: sessionID) == .separateWindow,
+              mirroringService.iPhoneAirPlayProcessID(sessionID: sessionID) != nil else {
             statusMessage = "请先以独立窗口模式启动 AirPlay 接收器。"
             return
         }
-        iPhoneMirrorWindowService.show(receiverName: iPhoneAirPlayName)
+        let services = ensureIPhoneMirrorSession(sessionID: sessionID)
+        services.window.show(receiverName: currentIPhoneReceiverName)
         statusMessage = "iPhone 独立投屏窗口已显示。"
     }
 
@@ -609,7 +620,7 @@ final class AppModel: ObservableObject {
         guard iPhoneMirrorMode != mode else { return }
         iPhoneMirrorMode = mode
         UserDefaults.standard.set(mode.rawValue, forKey: Self.iPhoneMirrorModeKey)
-        if mirroringService.iPhoneAirPlayProcessID != nil {
+        if isCurrentIPhoneMirroring {
             stopIPhoneMirroring()
             statusMessage = "已切换为“\(mode.label)”，请重新点击启动投屏。"
         } else {
@@ -622,7 +633,7 @@ final class AppModel: ObservableObject {
         iPhoneMirrorQuality = quality
         UserDefaults.standard.set(quality.rawValue, forKey: Self.iPhoneMirrorQualityKey)
         statusMessage = "iPhone 投屏已切换为“\(quality.label)”。"
-        if mirroringService.iPhoneAirPlayProcessID != nil {
+        if isCurrentIPhoneMirroring {
             restartIPhoneMirroring()
         }
     }
@@ -637,7 +648,7 @@ final class AppModel: ObservableObject {
         iPhoneAirPlayName = normalized
         UserDefaults.standard.set(normalized, forKey: Self.iPhoneAirPlayNameKey)
         statusMessage = "AirPlay 接收名称已改为“\(normalized)”。"
-        if mirroringService.iPhoneAirPlayProcessID != nil {
+        if isCurrentIPhoneMirroring {
             restartIPhoneMirroring()
         }
         return normalized
@@ -650,7 +661,7 @@ final class AppModel: ObservableObject {
         statusMessage = enabled
             ? "已开启附近设备投屏；连接时请输入 PIN \(iPhonePeerToPeerPIN)。"
             : "已切换为普通局域网 AirPlay。"
-        if mirroringService.iPhoneAirPlayProcessID != nil {
+        if isCurrentIPhoneMirroring {
             restartIPhoneMirroring()
         }
     }
@@ -659,7 +670,7 @@ final class AppModel: ObservableObject {
         iPhonePeerToPeerPIN = String(format: "%04d", Int.random(in: 0...9_999))
         UserDefaults.standard.set(iPhonePeerToPeerPIN, forKey: Self.iPhonePeerToPeerPINKey)
         statusMessage = "附近投屏 PIN 已更新为 \(iPhonePeerToPeerPIN)。"
-        if iPhonePeerToPeerEnabled, mirroringService.iPhoneAirPlayProcessID != nil {
+        if iPhonePeerToPeerEnabled, isCurrentIPhoneMirroring {
             restartIPhoneMirroring()
         }
     }
@@ -706,16 +717,22 @@ final class AppModel: ObservableObject {
     }
 
     func restartIPhoneMirroring() {
-        guard activeMirrorPlatform == .ios || selectedDevice?.platform == .ios else { return }
+        guard currentIPhoneMirrorSessionID != nil else { return }
         startIPhoneMirroring(allowWithoutConnectedDevice: true)
     }
 
     func stopIPhoneMirroring() {
+        guard let sessionID = currentIPhoneMirrorSessionID else { return }
+        stopIPhoneMirroring(sessionID: sessionID)
+    }
+
+    private func stopIPhoneMirroring(sessionID: String) {
         if mirrorCaptureService.isRecording { stopMirrorRecording() }
-        mirroringService.stopIPhoneAirPlay()
-        iPhoneMirrorWindowService.close()
-        embeddedIPhoneMirrorService.stop()
-        if activeMirrorPlatform == .ios { activeMirrorPlatform = nil }
+        mirroringService.stopIPhoneAirPlay(sessionID: sessionID)
+        iPhoneMirrorWindowServices[sessionID]?.close()
+        iPhoneMirrorServices[sessionID]?.stop()
+        activeIPhoneReceiverNames.removeValue(forKey: sessionID)
+        activeIPhoneMirrorSessionIDs.remove(sessionID)
     }
 
     func captureMirrorScreenshot() {
@@ -818,13 +835,15 @@ final class AppModel: ObservableObject {
     }
 
     private func currentMirrorCaptureSource() -> MirrorCaptureSource? {
-        switch activeMirrorPlatform ?? selectedDevice?.platform {
+        switch mirrorTargetPlatform {
         case .ios:
-            return .embedded { [weak self] in self?.embeddedIPhoneMirrorService.latestFrame }
+            guard let sessionID = currentIPhoneMirrorSessionID,
+                  let service = iPhoneMirrorServices[sessionID],
+                  mirroringService.iPhoneAirPlayProcessID(sessionID: sessionID) != nil else { return nil }
+            return .embedded { [weak service] in service?.latestFrame }
 
         case .android:
-            let deviceID = activeAndroidMirrorDeviceID ?? selectedDeviceID
-            guard let deviceID else { return nil }
+            guard let deviceID = mirrorTargetID else { return nil }
             guard let processID = mirroringService.androidMirrorProcessID(deviceID: deviceID) else { return nil }
             return .separateWindow(processID: processID)
 
@@ -1248,6 +1267,111 @@ final class AppModel: ObservableObject {
 
     var selectedDevice: PhoneDevice? {
         devices.first { $0.id == selectedDeviceID }
+    }
+
+    var mirrorTargetPlatform: PhonePlatform? {
+        if mirrorTargetID == Self.wirelessIPhoneMirrorSessionID { return .ios }
+        guard let mirrorTargetID else { return nil }
+        if activeIPhoneMirrorSessionIDs.contains(mirrorTargetID) { return .ios }
+        return devices.first { $0.id == mirrorTargetID }?.platform
+    }
+
+    var currentIPhoneMirrorService: EmbeddedIPhoneMirrorService {
+        guard let sessionID = currentIPhoneMirrorSessionID else { return idleIPhoneMirrorService }
+        return iPhoneMirrorServices[sessionID] ?? idleIPhoneMirrorService
+    }
+
+    var currentIPhoneReceiverName: String {
+        guard let sessionID = currentIPhoneMirrorSessionID else { return iPhoneAirPlayName }
+        return activeIPhoneReceiverNames[sessionID] ?? iPhoneReceiverName(for: sessionID)
+    }
+
+    var currentIPhoneMirrorMode: IPhoneMirrorMode {
+        guard let sessionID = currentIPhoneMirrorSessionID else { return iPhoneMirrorMode }
+        return mirroringService.iPhoneAirPlayMode(sessionID: sessionID) ?? iPhoneMirrorMode
+    }
+
+    var isCurrentIPhoneMirroring: Bool {
+        guard let sessionID = currentIPhoneMirrorSessionID else { return false }
+        return mirroringService.iPhoneAirPlayProcessID(sessionID: sessionID) != nil
+    }
+
+    var isWirelessIPhoneMirroring: Bool {
+        mirroringService.iPhoneAirPlayProcessID(sessionID: Self.wirelessIPhoneMirrorSessionID) != nil
+    }
+
+    func selectWirelessIPhoneMirrorTarget() {
+        mirrorTargetID = Self.wirelessIPhoneMirrorSessionID
+    }
+
+    var isMirrorTargetRunning: Bool {
+        guard let targetID = mirrorTargetID else { return false }
+        switch mirrorTargetPlatform {
+        case .android:
+            return mirroringService.androidMirrorProcessID(deviceID: targetID) != nil
+        case .ios:
+            return mirroringService.iPhoneAirPlayProcessID(sessionID: targetID) != nil
+        case nil:
+            return false
+        }
+    }
+
+    func isMirroring(deviceID: String) -> Bool {
+        guard let device = devices.first(where: { $0.id == deviceID }) else { return false }
+        switch device.platform {
+        case .android:
+            return mirroringService.androidMirrorProcessID(deviceID: deviceID) != nil
+        case .ios:
+            return mirroringService.iPhoneAirPlayProcessID(sessionID: deviceID) != nil
+        }
+    }
+
+    private var currentIPhoneMirrorSessionID: String? {
+        guard mirrorTargetPlatform == .ios else { return nil }
+        return mirrorTargetID
+    }
+
+    private func ensureIPhoneMirrorSession(
+        sessionID: String
+    ) -> (mirror: EmbeddedIPhoneMirrorService, window: IPhoneMirrorWindowService) {
+        if let mirror = iPhoneMirrorServices[sessionID],
+           let window = iPhoneMirrorWindowServices[sessionID] {
+            return (mirror, window)
+        }
+
+        let mirror = EmbeddedIPhoneMirrorService()
+        mirror.onStatus = { [weak self] message in
+            guard let self, self.mirrorTargetID == sessionID else { return }
+            self.statusMessage = message
+        }
+        let window = IPhoneMirrorWindowService(mirrorService: mirror, sessionID: sessionID)
+        iPhoneMirrorServices[sessionID] = mirror
+        iPhoneMirrorWindowServices[sessionID] = window
+        return (mirror, window)
+    }
+
+    private func iPhoneReceiverName(for sessionID: String) -> String {
+        guard sessionID != Self.wirelessIPhoneMirrorSessionID,
+              let device = devices.first(where: { $0.id == sessionID }) else {
+            return iPhoneAirPlayName
+        }
+
+        let duplicateIndex = devices
+            .filter { $0.platform == .ios && $0.name == device.name }
+            .firstIndex(where: { $0.id == sessionID })
+            .map { $0 + 1 }
+        let hasDuplicateName = devices.filter { $0.platform == .ios && $0.name == device.name }.count > 1
+        let rawSuffix: String
+        if hasDuplicateName, let duplicateIndex {
+            rawSuffix = "\(device.name) \(duplicateIndex)"
+        } else {
+            rawSuffix = device.name
+        }
+        let separator = " · "
+        let suffix = Self.truncatedUTF8(rawSuffix, maximumBytes: 24)
+        let baseLimit = max(8, 48 - separator.utf8.count - suffix.utf8.count)
+        let base = Self.truncatedUTF8(iPhoneAirPlayName, maximumBytes: baseLimit)
+        return "\(base)\(separator)\(suffix)"
     }
 
     private func refreshAndroidDevices(silent: Bool) async {
@@ -1698,6 +1822,16 @@ final class AppModel: ObservableObject {
             result = candidate
         }
         return result.isEmpty ? "PhoneBridge" : result
+    }
+
+    private static func truncatedUTF8(_ source: String, maximumBytes: Int) -> String {
+        var result = ""
+        for character in source {
+            let candidate = result + String(character)
+            guard candidate.utf8.count <= maximumBytes else { break }
+            result = candidate
+        }
+        return result.isEmpty ? "iPhone" : result
     }
 
     private func show(_ error: Error) {

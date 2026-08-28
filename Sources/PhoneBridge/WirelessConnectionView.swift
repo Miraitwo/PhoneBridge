@@ -80,7 +80,8 @@ struct WirelessConnectionView: View {
 
                             HStack {
                                 Button {
-                                    let wasActive = model.mirroringService.iPhoneAirPlayProcessID != nil
+                                    model.selectWirelessIPhoneMirrorTarget()
+                                    let wasActive = model.isWirelessIPhoneMirroring
                                     let previousName = model.iPhoneAirPlayName
                                     applyIPhoneReceiverName()
                                     if !wasActive || previousName == model.iPhoneAirPlayName {
@@ -94,10 +95,11 @@ struct WirelessConnectionView: View {
                                 .buttonStyle(.borderedProminent)
 
                                 Button("停止") {
+                                    model.selectWirelessIPhoneMirrorTarget()
                                     model.stopIPhoneMirroring()
                                 }
                                 .buttonStyle(.bordered)
-                                .disabled(model.mirroringService.iPhoneAirPlayProcessID == nil)
+                                .disabled(!model.isWirelessIPhoneMirroring)
                             }
                         }
                         .padding(6)
@@ -169,6 +171,7 @@ struct WirelessConnectionView: View {
     }
 
     private func applyIPhoneReceiverName() {
+        model.selectWirelessIPhoneMirrorTarget()
         iPhoneReceiverName = model.setIPhoneAirPlayName(iPhoneReceiverName)
     }
 

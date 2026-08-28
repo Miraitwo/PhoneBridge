@@ -324,7 +324,8 @@ final class AndroidADBService {
                     remotePath: path,
                     kind: kind,
                     size: size,
-                    modifiedAt: date
+                    modifiedAt: date,
+                    dateSortFallback: nil
                 )
             }
             .sorted {

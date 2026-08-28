@@ -115,6 +115,9 @@ struct RemoteEntry: Identifiable, Hashable, Codable {
     let kind: RemoteEntryKind
     let size: Int64
     let modifiedAt: Date?
+    /// Stable ordering fallback for devices that omit all usable media dates.
+    /// It is never displayed as a made-up date in the UI.
+    let dateSortFallback: Int64?
 
     var isDirectory: Bool { kind == .directory }
 }

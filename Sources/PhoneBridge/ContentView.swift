@@ -123,13 +123,7 @@ struct ContentView: View {
         } message: {
             Text(conflictDialogMessage)
         }
-        .onChange(of: model.selectedDeviceID) { _ in
-            isMirrorFocusMode = false
-            model.stopCurrentEmbeddedMirroring()
-        }
-        .onDisappear {
-            model.stopCurrentEmbeddedMirroring()
-        }
+        .onChange(of: model.selectedDeviceID) { _ in isMirrorFocusMode = false }
         .sheet(isPresented: $isWirelessTransferPresented) {
             WirelessTransferView(
                 service: model.wirelessTransferService,
@@ -311,7 +305,9 @@ struct ContentView: View {
                     isMirrorSidebarVisible = true
                 } label: {
                     Label(
-                        model.selectedDeviceID == deviceID && isMirrorSidebarVisible ? "正在投屏区" : "投屏",
+                        model.isMirroring(deviceID: deviceID)
+                            ? "投屏中"
+                            : (model.selectedDeviceID == deviceID && isMirrorSidebarVisible ? "投屏区" : "投屏"),
                         systemImage: "rectangle.on.rectangle"
                     )
                 }
@@ -520,7 +516,8 @@ struct ContentView: View {
     }
 
     private var mirrorSidebar: some View {
-        VStack(spacing: 0) {
+        let iPhoneMirrorService = model.currentIPhoneMirrorService
+        return VStack(spacing: 0) {
             panelTitle(symbol: "rectangle.on.rectangle", title: "手机投屏") {
                 Button {
                     isMirrorFocusMode.toggle()
@@ -533,7 +530,6 @@ struct ContentView: View {
                 Button {
                     isMirrorFocusMode = false
                     isMirrorSidebarVisible = false
-                    model.stopCurrentEmbeddedMirroring()
                 } label: {
                     Image(systemName: "xmark")
                 }
@@ -541,7 +537,7 @@ struct ContentView: View {
                 .help("关闭投屏侧栏")
             }
 
-            switch model.activeMirrorPlatform ?? model.selectedDevice?.platform {
+            switch model.mirrorTargetPlatform {
             case .ios:
                 Picker("显示方式", selection: Binding(
                     get: { model.iPhoneMirrorMode },
@@ -556,10 +552,10 @@ struct ContentView: View {
                 .padding(.horizontal, 12)
                 .padding(.top, 10)
 
-                if model.iPhoneMirrorMode == .embedded {
-                    EmbeddedIPhoneMirrorView(service: model.embeddedIPhoneMirrorService)
+                if model.currentIPhoneMirrorMode == .embedded {
+                    EmbeddedIPhoneMirrorView(service: iPhoneMirrorService)
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
-                        .padding(model.embeddedIPhoneMirrorService.state.isRunning ? 2 : 10)
+                        .padding(iPhoneMirrorService.state.isRunning ? 2 : 10)
                 } else {
                     VStack(spacing: 14) {
                         Image(systemName: "macwindow")
@@ -577,7 +573,7 @@ struct ContentView: View {
                             Label("显示独立窗口", systemImage: "macwindow")
                         }
                         .buttonStyle(.bordered)
-                        .disabled(model.mirroringService.iPhoneAirPlayProcessID == nil)
+                        .disabled(!model.isCurrentIPhoneMirroring)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                     .padding(24)
@@ -595,20 +591,20 @@ struct ContentView: View {
                     .labelsHidden()
                     .frame(width: 118)
 
-                    if model.iPhoneMirrorMode == .embedded,
-                       let size = model.embeddedIPhoneMirrorService.framePixelSize {
+                    if model.currentIPhoneMirrorMode == .embedded,
+                       let size = iPhoneMirrorService.framePixelSize {
                         Text("\(Int(size.width))×\(Int(size.height))")
                     }
-                    if model.iPhoneMirrorMode == .embedded,
-                       model.embeddedIPhoneMirrorService.framesPerSecond > 0 {
-                        Text(String(format: "%.1f fps", model.embeddedIPhoneMirrorService.framesPerSecond))
+                    if model.currentIPhoneMirrorMode == .embedded,
+                       iPhoneMirrorService.framesPerSecond > 0 {
+                        Text(String(format: "%.1f fps", iPhoneMirrorService.framesPerSecond))
                     }
                     Spacer()
                     Button("名称与无线设置") {
                         isWirelessConnectionPresented = true
                     }
                     .buttonStyle(.borderless)
-                    .help("当前接收名称：\(model.iPhoneAirPlayName)")
+                    .help("当前接收名称：\(model.currentIPhoneReceiverName)")
                 }
                 .font(.caption)
                 .foregroundStyle(.secondary)
@@ -641,7 +637,7 @@ struct ContentView: View {
                         model.startIPhoneMirroring(allowWithoutConnectedDevice: true)
                     } label: {
                         Label(
-                            model.mirroringService.iPhoneAirPlayProcessID != nil ? "重新启动" : "启动 AirPlay",
+                            model.isCurrentIPhoneMirroring ? "重新启动" : "启动 AirPlay",
                             systemImage: "airplayvideo"
                         )
                     }
@@ -651,19 +647,19 @@ struct ContentView: View {
                         model.stopIPhoneMirroring()
                     }
                     .buttonStyle(.bordered)
-                    .disabled(model.mirroringService.iPhoneAirPlayProcessID == nil)
+                    .disabled(!model.isCurrentIPhoneMirroring)
 
                     Button("刷新画面") {
                         model.restartIPhoneMirroring()
                     }
                     .buttonStyle(.bordered)
-                    .disabled(model.mirroringService.iPhoneAirPlayProcessID == nil)
+                    .disabled(!model.isCurrentIPhoneMirroring)
                 }
                 .controlSize(.small)
                 .padding(.horizontal, 12)
                 .padding(.bottom, 6)
 
-                if model.iPhoneMirrorMode == .separateWindow || !model.embeddedIPhoneMirrorService.state.isRunning {
+                if model.currentIPhoneMirrorMode == .separateWindow || !iPhoneMirrorService.state.isRunning {
                     VStack(alignment: .leading, spacing: 5) {
                         Label(
                             model.iPhonePeerToPeerEnabled
@@ -674,8 +670,8 @@ struct ContentView: View {
                         Label("打开 iPhone 控制中心 → 屏幕镜像", systemImage: "2.circle")
                         Label(
                             model.iPhonePeerToPeerEnabled
-                                ? "选择“\(model.iPhoneAirPlayName)”并输入 PIN"
-                                : "选择“\(model.iPhoneAirPlayName)”，无需登录 Apple ID",
+                                ? "选择“\(model.currentIPhoneReceiverName)”并输入 PIN"
+                                : "选择“\(model.currentIPhoneReceiverName)”，无需登录 Apple ID",
                             systemImage: "3.circle"
                         )
                     }
@@ -721,7 +717,7 @@ struct ContentView: View {
                 )
             }
 
-            if model.activeMirrorPlatform != nil
+            if model.isMirrorTargetRunning
                 || model.mirrorCaptureService.isRecording
                 || model.mirrorCaptureService.isFinishing
                 || model.mirrorCaptureService.hasPendingRecording {
@@ -807,7 +803,9 @@ struct ContentView: View {
             } label: {
                 Label("无线连接", systemImage: "wifi")
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.borderedProminent)
+            .tint(.blue)
+            .controlSize(.small)
 
             Button {
                 model.startWirelessTransferPortal()
@@ -815,7 +813,9 @@ struct ContentView: View {
             } label: {
                 Label("无线传输", systemImage: "qrcode")
             }
-            .buttonStyle(.borderless)
+            .buttonStyle(.borderedProminent)
+            .tint(.blue)
+            .controlSize(.small)
 
             Text("PhoneBridge · \(model.devices.count) 台设备")
         }
@@ -1045,9 +1045,17 @@ struct ContentView: View {
             case .size:
                 if lhs.size != rhs.size { return sort.ascending ? lhs.size < rhs.size : lhs.size > rhs.size }
             case .date:
-                let leftDate = lhs.modifiedAt ?? .distantPast
-                let rightDate = rhs.modifiedAt ?? .distantPast
-                if leftDate != rightDate { return sort.ascending ? leftDate < rightDate : leftDate > rightDate }
+                if let leftDate = lhs.modifiedAt, let rightDate = rhs.modifiedAt, leftDate != rightDate {
+                    return sort.ascending ? leftDate < rightDate : leftDate > rightDate
+                }
+                if (lhs.modifiedAt != nil) != (rhs.modifiedAt != nil) {
+                    return sort.ascending ? lhs.modifiedAt == nil : lhs.modifiedAt != nil
+                }
+                let leftFallback = lhs.dateSortFallback ?? 0
+                let rightFallback = rhs.dateSortFallback ?? 0
+                if leftFallback != rightFallback {
+                    return sort.ascending ? leftFallback < rightFallback : leftFallback > rightFallback
+                }
             }
             return lhs.name.localizedStandardCompare(rhs.name) == .orderedAscending
         }

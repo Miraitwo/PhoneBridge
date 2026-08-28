@@ -1,6 +1,6 @@
 # PhoneBridge 技术方案与实现说明
 
-> 适用版本：PhoneBridge 0.14.1（Build 25）
+> 适用版本：PhoneBridge 0.15.0（Build 27）
 > 文档定位：架构设计、关键实现、构建发布、验证现状和后续演进
 > 目标平台：Apple Silicon macOS 13+
 
@@ -34,6 +34,7 @@ PhoneBridge 希望在一个 macOS 原生界面中打通以下能力：
 - iPhone AirPlay 内嵌/独立窗口双模式及三档画质，无 USB 设备发现也可启动接收器。
 - AirPlay 接收名称自定义、持久化与运行中热切换。
 - Android scrcpy 独立可控制窗口投屏。
+- Android 与 iPhone 按设备隔离并发投屏会话；iPhone 独立窗口可同时展示多路画面。
 - 本地 HTTP 无线上传、文件下载和证书二维码。
 - Apple Silicon 自包含 DMG。
 
@@ -42,7 +43,7 @@ PhoneBridge 希望在一个 macOS 原生界面中打通以下能力：
 - 完整 iOS 文件系统管理。
 - 通过 iOS USB 照片接口写入任意文件。
 - Android 投屏内嵌到 PhoneBridge 主窗口。
-- 同时内嵌多路 iPhone 投屏。
+- 在同一个侧栏中并排展示多路 iPhone 画面；侧栏只显示当前选择的一路，其他会话继续运行。
 - iPhone 投屏音频。
 - 云端中转、跨公网传输或账号系统。
 - Windows、Linux 和 Intel Mac 发布包。
@@ -55,7 +56,7 @@ PhoneBridge 希望在一个 macOS 原生界面中打通以下能力：
 | 桌面 UI | SwiftUI + AppKit | 原生 macOS 体验；AppKit 补充拖拽、文件选择和系统操作 |
 | 状态管理 | `ObservableObject`、`@Published`、`@MainActor` | 与 SwiftUI 数据流直接结合，保证 UI 状态在主线程更新 |
 | Android 设备与文件 | ADB | 官方调试通道，USB/无线连接可复用同一套命令 |
-| Android 投屏 | scrcpy + ScreenCaptureKit | scrcpy 负责取流解码；ScreenCaptureKit 按窗口捕获后嵌入 SwiftUI，同时保留独立可控制模式 |
+| Android 投屏 | scrcpy；录制时使用 ScreenCaptureKit | scrcpy 按设备启动独立可控制窗口；仅截屏/录屏时由 ScreenCaptureKit 采集对应窗口 |
 | iOS 媒体 | ImageCaptureCore | macOS 系统公开框架，可读取已信任 iPhone 的照片和视频 |
 | iPhone 投屏接收 | UxPlay + GStreamer | 不依赖 Apple ID、QuickTime 或系统 iPhone 镜像功能 |
 | 内嵌帧通道 | Network.framework + JPEG + ImageIO | 实现成本低，可把 UxPlay 输出直接接入 SwiftUI |
@@ -361,6 +362,18 @@ adb disconnect <IP:连接端口>
 - UTI 符合 `UTType.movie` 时标记为视频。
 - 默认按创建日期倒序。
 
+不同 Mac、iOS 版本和照片来源下，ImageCaptureCore 的日期字段完整度不一致。0.15.0 按以下顺序选择第一个有效日期：
+
+1. `fileCreationDate`
+2. `exifCreationDate`
+3. `creationDate`
+4. `fileModificationDate`
+5. `exifModificationDate`
+6. `modificationDate`
+7. 从 `IMG_20260828_123456`、`2026-08-28` 等常见文件名解析
+
+若仍无日期，界面继续显示“—”，避免伪造拍摄时间；排序使用 PTP object handle，缺少 handle 时使用本次媒体目录的稳定序号。因此日期升序/降序仍可反转，且刷新后不会因全部日期为 `nil` 而随机抖动。
+
 内存中维护：
 
 ```text
@@ -650,13 +663,14 @@ sequenceDiagram
 
 ### 16.2 UxPlay 参数
 
-接收名称来自 `AppModel.iPhoneAirPlayName`，默认值为 `PhoneBridge`。普通局域网和附近设备模式使用同一名称，并通过 UxPlay 的 `-n` 参数发布。
+接收名称基础值来自 `AppModel.iPhoneAirPlayName`，默认值为 `PhoneBridge`。从已连接 iPhone 面板启动时追加设备名；设备重名时再追加序号。无线连接页直接启动的通用会话使用基础名称。所有名称通过 UxPlay 的 `-n` 参数发布。
 
 关键参数：
 
 ```text
 -n <receiverName>   发布到 iPhone“屏幕镜像”列表的接收名称
 -nh                 AirPlay 名称末尾不追加 Mac 主机名
+-m <deviceID>       为每路接收器设置稳定且不同的本地管理 MAC/Device ID
 -as 0               关闭音频输出
 -vsync no           不做 UxPlay 侧垂直同步
 -s <resolution>     请求视频分辨率
@@ -719,9 +733,13 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 
 ### 16.6 并发限制
 
-- UxPlay 只维护一个活动进程，因此同一时间只支持一路 iPhone 投屏（内嵌或独立）。
-- 切换选中设备时会停止当前活动投屏。
-- Android scrcpy 进程按设备分离，不受该限制。
+- `ScreenMirroringService` 以设备/session ID 为 key 管理多路 UxPlay `Process`、输出管道、日志尾部、停止状态和显示模式。
+- `AppModel` 为每路 iPhone 会话分别创建 `EmbeddedIPhoneMirrorService`、随机本机 TCP 端口和 `IPhoneMirrorWindowService`。
+- UxPlay 的 `-m` 参数使用 session ID 计算出的稳定、本地管理 MAC，避免同一 Mac 上多个接收器以相同 Device ID 广播；默认动态网络端口由 UxPlay 分配。
+- Android scrcpy 同样以 ADB serial 为 key 管理，可与多路 iPhone 同时运行。
+- 侧栏仅查看和控制 `mirrorTargetID` 对应会话；切换设备或收起侧栏不会停止其他进程。独立 iPhone 窗口按 session ID 分别保存窗口 frame。
+- 截屏和录屏服务仍是单任务模型，同一时间只处理当前选中的一路画面。
+- 每路 iPhone 都包含独立 JPEG 编解码链路，多路高清投屏的 CPU、内存和局域网带宽近似随路数增长。
 
 ### 16.7 接收名称配置
 
@@ -729,7 +747,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 - 名称会合并空白字符，空值回退为 `PhoneBridge`，并按完整 Unicode 字符截断到最多 48 个 UTF-8 字节。
 - `AppModel` 写入 `UserDefaults`，下次启动恢复。
 - 投屏运行中改名时，先停止当前 UxPlay，再以新 `-n` 参数自动启动；iPhone 需要重新选择接收器。
-- 投屏侧栏直接显示生效后的名称，便于多人环境现场核对。
+- 投屏侧栏直接显示当前会话最终生效的名称，便于多人、多设备环境现场核对。
 
 ### 16.8 投屏截屏与录屏
 
@@ -763,7 +781,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 - `AppModel`、`IOSMediaService`、`WirelessTransferService` 标记为 `@MainActor`，UI 状态集中在主线程更新。
 - ADB 命令通过 `ProcessRunner` 异步执行。
 - `ProcessRunner` 使用带锁 `DataBuffer` 并发收集 stdout/stderr。
-- iPhone JPEG 接收使用独立串行 `frameQueue`。
+- 每路 iPhone JPEG 接收各自使用独立串行 `frameQueue`。
 - 无线 HTTP 服务使用独立 `serverQueue`。
 - 回调需要更新 UI 时切回主线程。
 - 文件传输队列由 Task 串行消费，避免同方向任务无控制并发。
@@ -781,7 +799,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 
 - ADB 使用退出码、stderr、stdout 组合生成错误信息。
 - scrcpy 非零退出码提示检查 USB 调试授权。
-- UxPlay 保留最近 20 行日志，异常退出时带最近 3 行摘要。
+- 每路 UxPlay 独立保留最近 20 行日志，异常退出时带对应接收名称和最近 3 行摘要。
 
 ### 19.3 已知不足
 
@@ -849,7 +867,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 生成：
 
 ```text
-dist/PhoneBridge-0.14.2-AppleSilicon.dmg
+dist/PhoneBridge-0.15.0-AppleSilicon.dmg
 ```
 
 DMG 包含：
@@ -918,10 +936,10 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 
 ### 22.1 已完成验证
 
-- PhoneBridge 0.14.2 Release 编译通过，无 Swift 编译警告。
+- PhoneBridge 0.15.0 Release 编译通过，无 Swift 编译警告。
 - 主程序为 arm64 Mach-O。
 - DMG 创建、CRC 校验和只读挂载通过。
-- DMG 内 App 版本为 0.14.2，Build 26。
+- 当前源码和本地 App 版本为 0.15.0，Build 27；DMG/流水线发布待完成。
 - DMG 内 App 深度签名校验通过。
 - UxPlay、GStreamer、scrcpy、ADB 已封装。
 - UxPlay 启动检查所需的 `libav`、`autodetect` 插件及递归动态库已封装；使用包内运行环境启动后未再立即以插件缺失退出。
@@ -931,6 +949,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 - 错误令牌返回 404。
 - 8MB 合成文件的普通分段 POST 与 `Expect: 100-continue` 上传均成功，接收文件与源文件 SHA-256 一致。
 - 真实 iPhone 已验证媒体读取、缩略图、筛选、排序和批量勾选界面。
+- iOS 日期多字段、文件名解析和 PTP/目录稳定排序兜底已完成编译；需在出现日期缺失的那台 Mac 上回归实际数据。
 - 真实 Pixel 8a 已验证照片/视频自动扫描、图片/视频缩略图和 Android→Mac 传输。
 - Pixel 8a 的 scrcpy 独立窗口已验证启动；Android 内嵌投屏已从产品和代码中移除。
 - Pixel 8a 小图传到 Mac 后，文件修改时间与传输完成时间一致。
@@ -948,6 +967,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 - Android 11+ 无线配对、连接、断开和重连。
 - 多台 Android / iPhone 同时连接和面板拖动排序。
 - 多台 Android 同时 scrcpy。
+- 多台 iPhone 同时启动 UxPlay、分别连接、内嵌切换和独立窗口并行显示。
 - iPhone 普通 AirPlay 在不同路由器环境中的兼容性。
 - UxPlay `-p2p -pin` 附近设备模式的机型与系统版本覆盖。
 - 自定义中文/英文接收名称在多台 Mac 同场环境中的 AirPlay 列表显示与改名重连。
@@ -999,7 +1019,7 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 - 持久化面板顺序、宽度、搜索和筛选。
 - 支持面板关闭、重新打开、拖成标签页或独立窗口。
 - 为每个设备增加颜色、别名和连接状态详情。
-- 评估多路 iPhone 投屏的资源隔离和 UI 布局。
+- 评估多路 iPhone 投屏网格视图、窗口自动排布和资源占用上限。
 
 ### P2：正式分发
 

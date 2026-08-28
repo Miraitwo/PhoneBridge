@@ -4,10 +4,15 @@ import SwiftUI
 @MainActor
 final class IPhoneMirrorWindowService: NSObject, NSWindowDelegate {
     private let mirrorService: EmbeddedIPhoneMirrorService
+    private let frameAutosaveName: String
     private var mirrorWindow: NSWindow?
 
-    init(mirrorService: EmbeddedIPhoneMirrorService) {
+    init(mirrorService: EmbeddedIPhoneMirrorService, sessionID: String) {
         self.mirrorService = mirrorService
+        let stableSuffix = sessionID.unicodeScalars.reduce(UInt64(5381)) { partial, scalar in
+            ((partial << 5) &+ partial) &+ UInt64(scalar.value)
+        }
+        frameAutosaveName = "PhoneBridge.iPhoneMirrorWindow.\(stableSuffix)"
         super.init()
     }
 
@@ -40,13 +45,12 @@ final class IPhoneMirrorWindowService: NSObject, NSWindowDelegate {
         window.isReleasedWhenClosed = false
         window.collectionBehavior = [.fullScreenPrimary]
         window.delegate = self
-        let frameName = "PhoneBridge.iPhoneMirrorWindow"
-        let restoredFrame = window.setFrameUsingName(frameName)
+        let restoredFrame = window.setFrameUsingName(frameAutosaveName)
         if !restoredFrame {
             window.center()
         }
         ensureUsefulFrame(for: window)
-        window.setFrameAutosaveName(frameName)
+        window.setFrameAutosaveName(frameAutosaveName)
         mirrorWindow = window
         window.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)

@@ -12,7 +12,8 @@ final class DragCodecTests: XCTestCase {
             remotePath: "/IMG_0001.HEIC",
             kind: .image,
             size: 1_024,
-            modifiedAt: Date(timeIntervalSince1970: 1_700_000_000)
+            modifiedAt: Date(timeIntervalSince1970: 1_700_000_000),
+            dateSortFallback: 123
         )
 
         let payload = RemoteDragCodec.payload(for: [entry])

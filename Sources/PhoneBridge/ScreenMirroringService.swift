@@ -11,20 +11,28 @@ final class ScreenMirroringService {
     var onStatus: ((String) -> Void)?
     var onError: ((String) -> Void)?
     var onAndroidStopped: ((String, Bool) -> Void)?
-    var onIPhoneStopped: ((Bool) -> Void)?
+    var onIPhoneStopped: ((String, Bool) -> Void)?
 
     private var scrcpyProcesses: [String: Process] = [:]
     private var stoppingAndroidDeviceIDs = Set<String>()
-    private var uxPlayProcess: Process?
-    private var uxPlayOutputPipe: Pipe?
-    private var uxPlayLogTail: [String] = []
-    private var isStoppingUxPlay = false
-    private var iPhoneAirPlayReceiverName = "PhoneBridge"
-    private(set) var iPhoneAirPlayMode: IPhoneMirrorMode?
+    private struct IPhoneMirrorProcess {
+        let process: Process
+        let outputPipe: Pipe
+        var logTail: [String]
+        let receiverName: String
+        let mode: IPhoneMirrorMode
+    }
 
-    var iPhoneAirPlayProcessID: pid_t? {
-        guard let uxPlayProcess, uxPlayProcess.isRunning else { return nil }
-        return uxPlayProcess.processIdentifier
+    private var iPhoneProcesses: [String: IPhoneMirrorProcess] = [:]
+    private var stoppingIPhoneSessionIDs = Set<String>()
+
+    func iPhoneAirPlayProcessID(sessionID: String) -> pid_t? {
+        guard let process = iPhoneProcesses[sessionID]?.process, process.isRunning else { return nil }
+        return process.processIdentifier
+    }
+
+    func iPhoneAirPlayMode(sessionID: String) -> IPhoneMirrorMode? {
+        iPhoneProcesses[sessionID]?.mode
     }
 
     @discardableResult
@@ -108,6 +116,7 @@ final class ScreenMirroringService {
 
     @discardableResult
     func startIPhoneAirPlay(
+        sessionID: String,
         streamPort: UInt16? = nil,
         quality: IPhoneMirrorQuality,
         receiverName: String,
@@ -115,8 +124,9 @@ final class ScreenMirroringService {
         peerToPeer: Bool = false,
         pin: String? = nil
     ) -> pid_t? {
-        if let processID = iPhoneAirPlayProcessID {
-            onStatus?("AirPlay 接收器已经启动。请在 iPhone 的“屏幕镜像”中选择“\(iPhoneAirPlayReceiverName)”。")
+        if let processID = iPhoneAirPlayProcessID(sessionID: sessionID),
+           let receiverName = iPhoneProcesses[sessionID]?.receiverName {
+            onStatus?("AirPlay 接收器已经启动。请在 iPhone 的“屏幕镜像”中选择“\(receiverName)”。")
             return processID
         }
 
@@ -135,12 +145,11 @@ final class ScreenMirroringService {
         let normalizedReceiverName = receiverName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             ? "PhoneBridge"
             : receiverName
-        iPhoneAirPlayReceiverName = normalizedReceiverName
-        iPhoneAirPlayMode = mode
         process.executableURL = executable
         var arguments = [
             "-n", normalizedReceiverName,
             "-nh",
+            "-m", airPlayDeviceID(for: sessionID),
             "-as", "0",
             "-vsync", "no",
             "-s", quality.requestedResolution,
@@ -170,85 +179,103 @@ final class ScreenMirroringService {
         process.standardOutput = outputPipe
         process.standardError = outputPipe
 
-        uxPlayLogTail = []
-        isStoppingUxPlay = false
         outputPipe.fileHandleForReading.readabilityHandler = { [weak self] handle in
             let data = handle.availableData
             guard !data.isEmpty, let message = String(data: data, encoding: .utf8) else { return }
             Task { @MainActor in
-                self?.consumeUxPlayOutput(message)
+                self?.consumeUxPlayOutput(message, sessionID: sessionID)
             }
         }
 
         process.terminationHandler = { [weak self] finishedProcess in
             Task { @MainActor in
-                guard let self, self.uxPlayProcess === finishedProcess else { return }
-                let wasStoppedByUser = self.isStoppingUxPlay
-                self.uxPlayOutputPipe?.fileHandleForReading.readabilityHandler = nil
-                self.uxPlayOutputPipe = nil
-                self.uxPlayProcess = nil
-                self.iPhoneAirPlayMode = nil
-                self.isStoppingUxPlay = false
-                self.onIPhoneStopped?(!wasStoppedByUser && finishedProcess.terminationStatus != 0)
+                guard let self,
+                      let session = self.iPhoneProcesses[sessionID],
+                      session.process === finishedProcess else { return }
+                let wasStoppedByUser = self.stoppingIPhoneSessionIDs.remove(sessionID) != nil
+                session.outputPipe.fileHandleForReading.readabilityHandler = nil
+                let detail = session.logTail.suffix(3).joined(separator: " ")
+                self.iPhoneProcesses.removeValue(forKey: sessionID)
+                self.onIPhoneStopped?(sessionID, !wasStoppedByUser && finishedProcess.terminationStatus != 0)
 
                 if wasStoppedByUser || finishedProcess.terminationStatus == 0 {
-                    self.onStatus?("AirPlay 投屏已停止。")
+                    self.onStatus?("“\(session.receiverName)”AirPlay 投屏已停止。")
                 } else {
-                    let detail = self.uxPlayLogTail.suffix(3).joined(separator: " ")
                     let suffix = detail.isEmpty ? "" : " \(detail)"
-                    self.onError?("UxPlay 已退出（退出码 \(finishedProcess.terminationStatus)）。\(suffix)")
+                    self.onError?("“\(session.receiverName)”UxPlay 已退出（退出码 \(finishedProcess.terminationStatus)）。\(suffix)")
                 }
             }
         }
 
         do {
             try process.run()
-            uxPlayProcess = process
-            uxPlayOutputPipe = outputPipe
+            iPhoneProcesses[sessionID] = IPhoneMirrorProcess(
+                process: process,
+                outputPipe: outputPipe,
+                logTail: [],
+                receiverName: normalizedReceiverName,
+                mode: mode
+            )
             onStatus?(mode == .embedded
                 ? "正在启动“\(normalizedReceiverName)”AirPlay 内嵌接收器…"
                 : "正在启动“\(normalizedReceiverName)”AirPlay 独立窗口…")
             return process.processIdentifier
         } catch {
             outputPipe.fileHandleForReading.readabilityHandler = nil
-            iPhoneAirPlayMode = nil
             onError?("无法启动 UxPlay：\(error.localizedDescription)")
             return nil
         }
     }
 
-    func stopIPhoneAirPlay() {
-        guard let process = uxPlayProcess, process.isRunning else {
-            uxPlayProcess = nil
-            iPhoneAirPlayMode = nil
+    func stopIPhoneAirPlay(sessionID: String) {
+        guard let session = iPhoneProcesses[sessionID], session.process.isRunning else {
+            iPhoneProcesses.removeValue(forKey: sessionID)
             return
         }
-        isStoppingUxPlay = true
-        uxPlayOutputPipe?.fileHandleForReading.readabilityHandler = nil
-        uxPlayOutputPipe = nil
-        uxPlayProcess = nil
-        iPhoneAirPlayMode = nil
-        process.interrupt()
-        onStatus?("正在停止 AirPlay 投屏…")
+        stoppingIPhoneSessionIDs.insert(sessionID)
+        session.outputPipe.fileHandleForReading.readabilityHandler = nil
+        session.process.interrupt()
+        onStatus?("正在停止“\(session.receiverName)”AirPlay 投屏…")
     }
 
-    private func consumeUxPlayOutput(_ output: String) {
+    private func consumeUxPlayOutput(_ output: String, sessionID: String) {
+        guard var session = iPhoneProcesses[sessionID] else { return }
         let lines = output
             .split(whereSeparator: \.isNewline)
             .map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
             .filter { !$0.isEmpty }
 
-        uxPlayLogTail.append(contentsOf: lines)
-        if uxPlayLogTail.count > 20 {
-            uxPlayLogTail.removeFirst(uxPlayLogTail.count - 20)
+        session.logTail.append(contentsOf: lines)
+        if session.logTail.count > 20 {
+            session.logTail.removeFirst(session.logTail.count - 20)
         }
+        iPhoneProcesses[sessionID] = session
 
         if lines.contains(where: { $0.contains("Initialized server socket") }) {
-            onStatus?("AirPlay 接收器已启动。请在 iPhone 控制中心 → 屏幕镜像中选择“\(iPhoneAirPlayReceiverName)”。")
+            onStatus?("AirPlay 接收器已启动。请在 iPhone 控制中心 → 屏幕镜像中选择“\(session.receiverName)”。")
         }
         if lines.contains(where: { $0.contains("SO_RECV_ANYIF") && $0.localizedCaseInsensitiveContains("failed") }) {
             onError?("附近设备 AirPlay 启动失败。请确认 Mac 的 Wi-Fi、蓝牙和本地网络权限已开启，再重新启动接收器。")
         }
+    }
+
+    /// UxPlay requires a distinct advertised Device ID for concurrent
+    /// receivers on the same Mac. Keep it stable per PhoneBridge session so
+    /// iPhone does not see a different receiver after every restart.
+    private func airPlayDeviceID(for sessionID: String) -> String {
+        var hash = UInt64(5381)
+        for scalar in sessionID.unicodeScalars {
+            hash = ((hash << 5) &+ hash) &+ UInt64(scalar.value)
+        }
+        let bytes: [UInt8] = [
+            0x02,
+            UInt8(truncatingIfNeeded: hash >> 32),
+            UInt8(truncatingIfNeeded: hash >> 24),
+            UInt8(truncatingIfNeeded: hash >> 16),
+            UInt8(truncatingIfNeeded: hash >> 8),
+            UInt8(truncatingIfNeeded: hash)
+        ]
+        return bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
     }
 
     private func findScrcpy() -> URL? {

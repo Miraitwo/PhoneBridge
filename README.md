@@ -15,6 +15,7 @@ PhoneBridge 是一款个人使用的 macOS 手机文件传输与投屏工具。�
 - Android：浏览 `/sdcard` 路径中的目录、图片和视频；点击“照片 / 视频”可自动扫描常用媒体目录。
 - Android：按需生成图片和视频缩略图，视频缩略图显示播放标识。
 - iPhone/iPad：通过 macOS ImageCaptureCore 读取系统照片库中的图片和视频。
+- iPhone/iPad：日期依次使用文件、EXIF、通用创建/修改日期和文件名时间；仍缺失时保留“—”，但可通过 PTP/目录顺序稳定排序。
 - iPhone/iPad：按需加载图片和视频缩略图；视频缩略图显示播放标识。
 - 手机侧支持照片/视频分类筛选、文件名搜索和当前结果全选。
 - 每个手机文件都有明确的勾选框，可勾选多个文件后点击“传输到 Mac”。
@@ -39,6 +40,7 @@ PhoneBridge 是一款个人使用的 macOS 手机文件传输与投屏工具。�
 - iPhone AirPlay 接收名称可在“无线连接”中自定义并持久保存，支持中文；多人同时使用时可加入姓名、工位或设备编号，避免在“屏幕镜像”列表中混淆。
 - 最右侧投屏栏默认隐藏，不再长期占用手机文件区；iPhone 可选“内嵌显示 / 独立窗口”，Android 固定使用 scrcpy 独立窗口。iPhone 无需登录 Apple ID，也不需要先插数据线即可从“无线连接”启动 AirPlay 接收器。
 - Android 独立窗口保留低延迟、键鼠控制、剪贴板和拖放能力，避免内嵌采集造成的额外窗口与稳定性问题。
+- 支持多台手机同时投屏：Android 按设备并行启动 scrcpy；iPhone 按设备隔离 UxPlay、画面端口和窗口，AirPlay 名称自动附加设备名以便区分。切换设备或收起投屏侧栏不会中断其他投屏。
 - 投屏工具栏支持一键 PNG 截屏和 H.264 MP4 录屏；停止录制后可修改录像名称并选择 Mac 保存位置，窗口会自动记住上次使用的文件夹。iPhone 两种显示方式都直接保存接收到的原始投屏帧；Android 独立窗口使用 ScreenCaptureKit 采集对应窗口。
 
 ## 构建
@@ -133,10 +135,10 @@ cmake --install build --prefix /opt/homebrew
 - Android 仅显示文件夹、图片和视频，其他文件会被过滤。
 - iPhone 侧是按日期排序的平铺媒体列表，不展示 iOS 内部 DCIM 目录结构。
 - iPhone AirPlay 可在内嵌侧栏与独立窗口之间切换；Android scrcpy 只使用独立窗口。
-- 多设备文件面板可同时展开，但内嵌 iPhone 投屏同一时间只保留一个活动设备。
+- 多台 Android/iPhone 可同时保持投屏；侧栏同一时间查看当前选中的一路，iPhone 独立窗口模式可同时展示多路画面。多路高清 iPhone 投屏会明显增加 CPU、内存和局域网带宽占用。
 - iPhone 普通 AirPlay 需要与 Mac 处于可互相发现的局域网；公司 Wi-Fi 若屏蔽 Bonjour/mDNS，设备可能无法出现。附近设备模式可绕开部分局域网限制，但仍受机型、系统版本和无线环境影响。
 - iPhone 暂不支持由 Mac 静默写入任意系统目录；Mac 文件通过无线下载页交给 iOS，保存位置由用户在“存储到文件”中选择。
-- 已使用真实 iPhone 和 Pixel 8a 验证媒体读取、缩略图、筛选、排序、传输与 Android scrcpy 独立窗口投屏。
+- 已使用真实 iPhone 和 Pixel 8a 验证媒体读取、缩略图、筛选、排序、传输与 Android scrcpy 独立窗口投屏；多台 iPhone/Android 同时投屏仍需在不同机型和网络环境下补充实机覆盖。
 
 ## 开源许可
 
