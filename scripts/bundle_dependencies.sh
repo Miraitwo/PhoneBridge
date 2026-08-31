@@ -203,7 +203,7 @@ cp "$PROJECT_DIR/Resources/THIRD_PARTY_NOTICES.txt" "$LICENSES_DIR/THIRD_PARTY_N
 
 tar \
     --exclude='.git' \
-    --exclude='build' \
+    --exclude='build*' \
     --exclude='CMakeFiles' \
     -czf "$SOURCES_DIR/UxPlay-source.tar.gz" \
     -C "$(dirname "$UXPLAY_SOURCE_DIR")" \

@@ -96,6 +96,7 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
     @Published private(set) var framesPerSecond: Double = 0
 
     var onStatus: ((String) -> Void)?
+    var onStreamEnded: (() -> Void)?
 
     private let frameQueue = DispatchQueue(label: "com.personal.phonebridge.airplay-frames")
     private var listener: NWListener?
@@ -105,6 +106,7 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
     private(set) var streamPort: UInt16?
     private var frameMeasurementStartedAt = Date()
     private var measuredFrameCount = 0
+    private var currentConnectionReceivedFrame = false
 
     func markStartingAirPlayReceiver() {
         state = .startingAirPlayReceiver
@@ -174,6 +176,7 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
 
             self.connection?.cancel()
             self.connection = newConnection
+            self.currentConnectionReceivedFrame = false
             newConnection.start(queue: self.frameQueue)
             self.receiveNextChunk(from: newConnection, generation: generation)
         }
@@ -206,6 +209,8 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
             }
 
             if isComplete || error != nil {
+                let endedAfterReceivingFrames = self.currentConnectionReceivedFrame
+                self.currentConnectionReceivedFrame = false
                 activeConnection.cancel()
                 if self.connection === activeConnection {
                     self.connection = nil
@@ -216,8 +221,13 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
                     self.latestFrame = nil
                     self.framePixelSize = nil
                     self.framesPerSecond = 0
-                    self.state = .waitingForIPhone
-                    self.onStatus?(self.state.message)
+                    if endedAfterReceivingFrames {
+                        self.onStatus?("iPhone 已断开投屏，正在关闭接收器…")
+                        self.onStreamEnded?()
+                    } else {
+                        self.state = .waitingForIPhone
+                        self.onStatus?(self.state.message)
+                    }
                 }
                 return
             }
@@ -231,6 +241,7 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
         for jpegData in jpegFrames {
             guard let source = CGImageSourceCreateWithData(jpegData as CFData, nil),
                   let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else { continue }
+            currentConnectionReceivedFrame = true
 
             DispatchQueue.main.async { [weak self] in
                 guard let self,
@@ -255,6 +266,7 @@ final class EmbeddedIPhoneMirrorService: ObservableObject {
 
     private func stopReceiver(clearPort: Bool) {
         receiverGeneration = UUID()
+        currentConnectionReceivedFrame = false
         releaseReceiverResources()
         frameParser.reset()
         if clearPort {

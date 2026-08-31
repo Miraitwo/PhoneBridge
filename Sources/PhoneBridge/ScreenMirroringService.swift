@@ -1,9 +1,36 @@
 import AppKit
+import Darwin
 import Foundation
 
 struct AndroidMirrorLaunch {
     let processID: pid_t
     let windowTitle: String
+}
+
+enum MirroringProcessLifecycle {
+    static let uxPlayStreamEndedMarkers = [
+        "video_reset: type = RTP_Shutdown",
+        "This packet indicates video stream is stopping",
+        "raop_rtp_mirror tcp socket was closed by client",
+        "on_video_stop"
+    ]
+
+    static func uxPlayOutputIndicatesStreamEnded(_ lines: [String]) -> Bool {
+        lines.contains { line in
+            uxPlayStreamEndedMarkers.contains { line.localizedCaseInsensitiveContains($0) }
+        }
+    }
+
+    static func processIDs(inPSOutput output: String, executablePath: String) -> [pid_t] {
+        output.split(whereSeparator: \.isNewline).compactMap { rawLine in
+            let line = rawLine.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard let separator = line.firstIndex(where: \.isWhitespace),
+                  let processID = pid_t(line[..<separator]) else { return nil }
+            let command = line[separator...].trimmingCharacters(in: .whitespacesAndNewlines)
+            guard command == executablePath || command.hasPrefix(executablePath + " ") else { return nil }
+            return processID
+        }
+    }
 }
 
 @MainActor
@@ -26,6 +53,10 @@ final class ScreenMirroringService {
     private var iPhoneProcesses: [String: IPhoneMirrorProcess] = [:]
     private var stoppingIPhoneSessionIDs = Set<String>()
 
+    init() {
+        cleanupOrphanedBundledUxPlayProcesses()
+    }
+
     func iPhoneAirPlayProcessID(sessionID: String) -> pid_t? {
         guard let process = iPhoneProcesses[sessionID]?.process, process.isRunning else { return nil }
         return process.processIdentifier
@@ -33,6 +64,16 @@ final class ScreenMirroringService {
 
     func iPhoneAirPlayMode(sessionID: String) -> IPhoneMirrorMode? {
         iPhoneProcesses[sessionID]?.mode
+    }
+
+    var activeIPhoneAirPlaySessionIDs: [String] {
+        iPhoneProcesses.compactMap { sessionID, session in
+            session.process.isRunning ? sessionID : nil
+        }
+    }
+
+    var hasRunningIPhoneAirPlayReceiver: Bool {
+        !activeIPhoneAirPlaySessionIDs.isEmpty
     }
 
     @discardableResult
@@ -130,6 +171,12 @@ final class ScreenMirroringService {
             return processID
         }
 
+        if let activeSessionID = activeIPhoneAirPlaySessionIDs.first,
+           activeSessionID != sessionID {
+            onError?("已有一个 iPhone AirPlay 接收器正在运行，请等待它停止后再启动。")
+            return nil
+        }
+
         if streamPort == nil {
             onError?("投屏画面通道尚未准备好，请重新启动投屏。")
             return nil
@@ -149,7 +196,8 @@ final class ScreenMirroringService {
         var arguments = [
             "-n", normalizedReceiverName,
             "-nh",
-            "-m", airPlayDeviceID(for: sessionID),
+            "-m", airPlayDeviceID,
+            "-d", "1",
             "-as", "0",
             "-vsync", "no",
             "-s", quality.requestedResolution,
@@ -232,10 +280,38 @@ final class ScreenMirroringService {
             iPhoneProcesses.removeValue(forKey: sessionID)
             return
         }
-        stoppingIPhoneSessionIDs.insert(sessionID)
-        session.outputPipe.fileHandleForReading.readabilityHandler = nil
-        session.process.interrupt()
+        guard stoppingIPhoneSessionIDs.insert(sessionID).inserted else { return }
+        sendSignal(SIGINT, to: session.process)
         onStatus?("正在停止“\(session.receiverName)”AirPlay 投屏…")
+        scheduleIPhoneStopEscalation(
+            sessionID: sessionID,
+            process: session.process,
+            receiverName: session.receiverName
+        )
+    }
+
+    func stopAllIPhoneAirPlay() {
+        for sessionID in activeIPhoneAirPlaySessionIDs {
+            stopIPhoneAirPlay(sessionID: sessionID)
+        }
+    }
+
+    /// Called during NSApplication termination. It intentionally blocks for a
+    /// short bounded interval so child receivers cannot be adopted by launchd.
+    func shutdownSynchronously() {
+        let childProcesses = Array(iPhoneProcesses.values.map(\.process))
+            + Array(scrcpyProcesses.values)
+        for process in childProcesses where process.isRunning {
+            sendSignal(SIGINT, to: process)
+        }
+        waitForProcessesToExit(childProcesses, timeout: 0.35)
+        for process in childProcesses where isProcessAlive(process.processIdentifier) {
+            sendSignal(SIGTERM, to: process)
+        }
+        waitForProcessesToExit(childProcesses, timeout: 0.35)
+        for process in childProcesses where isProcessAlive(process.processIdentifier) {
+            sendSignal(SIGKILL, to: process)
+        }
     }
 
     private func consumeUxPlayOutput(_ output: String, sessionID: String) {
@@ -257,25 +333,96 @@ final class ScreenMirroringService {
         if lines.contains(where: { $0.contains("SO_RECV_ANYIF") && $0.localizedCaseInsensitiveContains("failed") }) {
             onError?("附近设备 AirPlay 启动失败。请确认 Mac 的 Wi-Fi、蓝牙和本地网络权限已开启，再重新启动接收器。")
         }
+        if MirroringProcessLifecycle.uxPlayOutputIndicatesStreamEnded(lines) {
+            onStatus?("iPhone 已断开投屏，正在关闭 AirPlay 接收器…")
+            stopIPhoneAirPlay(sessionID: sessionID)
+        }
     }
 
-    /// UxPlay requires a distinct advertised Device ID for concurrent
-    /// receivers on the same Mac. Keep it stable per PhoneBridge session so
-    /// iPhone does not see a different receiver after every restart.
-    private func airPlayDeviceID(for sessionID: String) -> String {
-        var hash = UInt64(5381)
-        for scalar in sessionID.unicodeScalars {
-            hash = ((hash << 5) &+ hash) &+ UInt64(scalar.value)
+    /// A single stable, locally administered Device ID lets Bonjour replace a
+    /// previous advertisement instead of caching one identity per phone.
+    private var airPlayDeviceID: String {
+        "02:50:42:52:49:44"
+    }
+
+    private func scheduleIPhoneStopEscalation(
+        sessionID: String,
+        process: Process,
+        receiverName: String
+    ) {
+        let processID = process.processIdentifier
+        Task { @MainActor [weak self, weak process] in
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard let self, let process,
+                  self.iPhoneProcesses[sessionID]?.process === process,
+                  self.isProcessAlive(processID) else { return }
+            self.sendSignal(SIGTERM, to: process)
+
+            try? await Task.sleep(nanoseconds: 500_000_000)
+            guard self.iPhoneProcesses[sessionID]?.process === process,
+                  self.isProcessAlive(processID) else { return }
+            self.sendSignal(SIGKILL, to: process)
+            self.onStatus?("“\(receiverName)”未正常退出，已强制关闭 AirPlay 接收器。")
         }
-        let bytes: [UInt8] = [
-            0x02,
-            UInt8(truncatingIfNeeded: hash >> 32),
-            UInt8(truncatingIfNeeded: hash >> 24),
-            UInt8(truncatingIfNeeded: hash >> 16),
-            UInt8(truncatingIfNeeded: hash >> 8),
-            UInt8(truncatingIfNeeded: hash)
-        ]
-        return bytes.map { String(format: "%02x", $0) }.joined(separator: ":")
+    }
+
+    private func cleanupOrphanedBundledUxPlayProcesses() {
+        guard let executablePath = Bundle.main.resourceURL?
+            .appendingPathComponent("uxplay").path,
+              FileManager.default.isExecutableFile(atPath: executablePath) else { return }
+
+        let ps = Process()
+        let outputPipe = Pipe()
+        ps.executableURL = URL(fileURLWithPath: "/bin/ps")
+        ps.arguments = ["-axo", "pid=,command="]
+        ps.standardOutput = outputPipe
+        ps.standardError = FileHandle.nullDevice
+        do {
+            try ps.run()
+            // Drain stdout before waiting. `ps -axo ...` can exceed the pipe
+            // buffer on a busy Mac; waiting first would leave ps blocked on a
+            // full pipe and freeze PhoneBridge during AppModel initialization.
+            let outputData = outputPipe.fileHandleForReading.readDataToEndOfFile()
+            ps.waitUntilExit()
+            let output = String(data: outputData, encoding: .utf8) ?? ""
+
+            let processIDs = MirroringProcessLifecycle.processIDs(
+                inPSOutput: output,
+                executablePath: executablePath
+            )
+            for processID in processIDs where processID != getpid() {
+                _ = Darwin.kill(processID, SIGTERM)
+            }
+            waitForProcessIDsToExit(processIDs, timeout: 0.3)
+            for processID in processIDs where isProcessAlive(processID) {
+                _ = Darwin.kill(processID, SIGKILL)
+            }
+        } catch {
+            return
+        }
+    }
+
+    private func sendSignal(_ signal: Int32, to process: Process) {
+        guard process.processIdentifier > 0, isProcessAlive(process.processIdentifier) else { return }
+        _ = Darwin.kill(process.processIdentifier, signal)
+    }
+
+    private func isProcessAlive(_ processID: pid_t) -> Bool {
+        guard processID > 0 else { return false }
+        if Darwin.kill(processID, 0) == 0 { return true }
+        return errno == EPERM
+    }
+
+    private func waitForProcessesToExit(_ processes: [Process], timeout: TimeInterval) {
+        waitForProcessIDsToExit(processes.map(\.processIdentifier), timeout: timeout)
+    }
+
+    private func waitForProcessIDsToExit(_ processIDs: [pid_t], timeout: TimeInterval) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while Date() < deadline,
+              processIDs.contains(where: isProcessAlive) {
+            usleep(25_000)
+        }
     }
 
     private func findScrcpy() -> URL? {

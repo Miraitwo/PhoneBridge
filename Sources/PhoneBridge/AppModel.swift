@@ -76,6 +76,7 @@ final class AppModel: ObservableObject {
     private var uploadWorkerIsRunning = false
     private var activeAndroidTextReverse: (deviceID: String, port: Int)?
     private var androidQRPairingTask: Task<Void, Never>?
+    private var iPhoneLaunchTask: Task<Void, Never>?
     private let thumbnailCache = NSCache<NSString, NSData>()
     private var thumbnailLoads: [String: Task<Data?, Never>] = [:]
     private let androidThumbnailLimiter = AndroidThumbnailLimiter(limit: 2)
@@ -562,18 +563,23 @@ final class AppModel: ObservableObject {
             return
         }
 
-        if mirroringService.iPhoneAirPlayProcessID(sessionID: sessionID) != nil {
-            stopIPhoneMirroring(sessionID: sessionID)
-            Task { @MainActor [weak self] in
+        iPhoneLaunchTask?.cancel()
+        if mirroringService.hasRunningIPhoneAirPlayReceiver {
+            statusMessage = "正在关闭旧的 iPhone 接收器…"
+            stopAllIPhoneMirroring()
+            iPhoneLaunchTask = Task { @MainActor [weak self] in
                 guard let self else { return }
-                for _ in 0..<30 {
-                    if self.mirroringService.iPhoneAirPlayProcessID(sessionID: sessionID) == nil {
+                for _ in 0..<40 {
+                    guard !Task.isCancelled else { return }
+                    if !self.mirroringService.hasRunningIPhoneAirPlayReceiver {
                         self.launchIPhoneAirPlay(sessionID: sessionID)
+                        self.iPhoneLaunchTask = nil
                         return
                     }
                     try? await Task.sleep(nanoseconds: 100_000_000)
                 }
                 self.errorMessage = "旧的 AirPlay 接收器未能及时停止，请稍后重新点击启动。"
+                self.iPhoneLaunchTask = nil
             }
             return
         }
@@ -781,8 +787,23 @@ final class AppModel: ObservableObject {
     }
 
     func stopIPhoneMirroring() {
-        guard let sessionID = currentIPhoneMirrorSessionID else { return }
-        stopIPhoneMirroring(sessionID: sessionID)
+        iPhoneLaunchTask?.cancel()
+        iPhoneLaunchTask = nil
+        stopAllIPhoneMirroring()
+    }
+
+    private func stopAllIPhoneMirroring() {
+        if mirrorCaptureService.isRecording { stopMirrorRecording() }
+        let sessionIDs = Set(iPhoneMirrorServices.keys)
+            .union(activeIPhoneMirrorSessionIDs)
+            .union(mirroringService.activeIPhoneAirPlaySessionIDs)
+        mirroringService.stopAllIPhoneAirPlay()
+        for sessionID in sessionIDs {
+            iPhoneMirrorWindowServices[sessionID]?.close()
+            iPhoneMirrorServices[sessionID]?.stop()
+        }
+        activeIPhoneReceiverNames.removeAll()
+        activeIPhoneMirrorSessionIDs.removeAll()
     }
 
     private func stopIPhoneMirroring(sessionID: String) {
@@ -792,6 +813,13 @@ final class AppModel: ObservableObject {
         iPhoneMirrorServices[sessionID]?.stop()
         activeIPhoneReceiverNames.removeValue(forKey: sessionID)
         activeIPhoneMirrorSessionIDs.remove(sessionID)
+    }
+
+    func shutdown() {
+        iPhoneLaunchTask?.cancel()
+        iPhoneLaunchTask = nil
+        androidQRPairingTask?.cancel()
+        mirroringService.shutdownSynchronously()
     }
 
     func captureMirrorScreenshot() {
@@ -1468,6 +1496,11 @@ final class AppModel: ObservableObject {
         mirror.onStatus = { [weak self] message in
             guard let self, self.mirrorTargetID == sessionID else { return }
             self.statusMessage = message
+        }
+        mirror.onStreamEnded = { [weak self] in
+            guard let self,
+                  self.mirroringService.iPhoneAirPlayProcessID(sessionID: sessionID) != nil else { return }
+            self.stopIPhoneMirroring(sessionID: sessionID)
         }
         let window = IPhoneMirrorWindowService(mirrorService: mirror, sessionID: sessionID)
         iPhoneMirrorServices[sessionID] = mirror

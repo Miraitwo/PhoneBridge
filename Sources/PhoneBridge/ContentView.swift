@@ -35,6 +35,15 @@ private enum MediaKindFilter: String, CaseIterable, Identifiable {
     }
 }
 
+private enum FileColumnMetrics {
+    static let sizeWidth: CGFloat = 76
+    static let dateWidth: CGFloat = 120
+    static let localNameWidth: CGFloat = 180
+    static let remoteNameWidth: CGFloat = 140
+    static let localLeadingWidth: CGFloat = 20 + 8 + localNameWidth
+    static let remoteLeadingWidth: CGFloat = 18 + 8 + 64 + 8 + remoteNameWidth
+}
+
 private struct PendingTransferRequest {
     let entries: [RemoteEntry]
     let destination: URL
@@ -68,23 +77,7 @@ struct ContentView: View {
                 mirrorSidebar
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
-                HSplitView {
-                    macPanel
-                        .frame(minWidth: 420)
-                    if model.devices.isEmpty {
-                        emptyPhonePanel
-                            .frame(minWidth: 360, idealWidth: 440)
-                    } else {
-                        ForEach(model.devices) { device in
-                            phonePanel(for: device)
-                                .frame(minWidth: 360, idealWidth: 460)
-                        }
-                    }
-                    if isMirrorSidebarVisible {
-                        mirrorSidebar
-                            .frame(minWidth: 300, idealWidth: 360, maxWidth: 520)
-                    }
-                }
+                fileWorkspace
                 Divider()
                 transferBar
             }
@@ -145,6 +138,57 @@ struct ContentView: View {
         }
     }
 
+    private var fileWorkspace: some View {
+        HSplitView {
+            independentlyScrollablePanel(minimumContentWidth: 460) {
+                macPanel
+            }
+            .frame(minWidth: 280, idealWidth: 400, maxWidth: 520)
+
+            if model.devices.isEmpty {
+                independentlyScrollablePanel(minimumContentWidth: 480) {
+                    emptyPhonePanel
+                }
+                .frame(minWidth: 260, idealWidth: 480, maxWidth: .infinity)
+            } else {
+                ForEach(Array(model.devices.enumerated()), id: \.element.id) { index, device in
+                    let isLastDevice = index == model.devices.count - 1
+                    independentlyScrollablePanel(minimumContentWidth: 500) {
+                        phonePanel(for: device)
+                    }
+                    .frame(
+                        minWidth: 260,
+                        idealWidth: isLastDevice ? 560 : 460,
+                        maxWidth: isLastDevice ? .infinity : 580
+                    )
+                }
+            }
+
+            if isMirrorSidebarVisible {
+                mirrorSidebar
+                    .frame(minWidth: 300, idealWidth: 360, maxWidth: 520)
+            }
+        }
+    }
+
+    private func independentlyScrollablePanel<Content: View>(
+        minimumContentWidth: CGFloat,
+        @ViewBuilder content: @escaping () -> Content
+    ) -> some View {
+        GeometryReader { geometry in
+            let horizontalScrollerHeight: CGFloat = 16
+            let contentHeight = max(0, geometry.size.height - horizontalScrollerHeight)
+            ScrollView(.horizontal, showsIndicators: true) {
+                content()
+                    .frame(
+                        width: max(geometry.size.width, minimumContentWidth),
+                        height: contentHeight,
+                        alignment: .topLeading
+                    )
+            }
+        }
+    }
+
     private var macPanel: some View {
         let entries = visibleLocalEntries
         return MacDropReceiver(
@@ -170,7 +214,11 @@ struct ContentView: View {
                     searchPlaceholder: "搜索 Mac"
                 )
 
-                columnHeader(sort: $localSort, onSort: model.refreshLocal)
+                columnHeader(
+                    sort: $localSort,
+                    leadingColumnWidth: FileColumnMetrics.localLeadingWidth,
+                    onSort: model.refreshLocal
+                )
                 GeometryReader { geometry in
                     ScrollView {
                         LazyVStack(spacing: 0) {
@@ -396,6 +444,7 @@ struct ContentView: View {
 
             columnHeader(
                 sort: remoteSortBinding(for: deviceID),
+                leadingColumnWidth: FileColumnMetrics.remoteLeadingWidth,
                 onSort: { Task { await model.refreshRemote(deviceID: deviceID) } }
             )
             if entries.isEmpty {
@@ -838,6 +887,8 @@ struct ContentView: View {
         .padding(.horizontal, 12)
         .padding(.vertical, 10)
         .background(.bar)
+        .fixedSize(horizontal: false, vertical: true)
+        .layoutPriority(10)
     }
 
     private func pathBar(
@@ -921,15 +972,17 @@ struct ContentView: View {
 
     private func columnHeader(
         sort: Binding<FileSortOption>,
+        leadingColumnWidth: CGFloat,
         onSort: @escaping () -> Void
     ) -> some View {
         HStack(spacing: 8) {
             sortHeaderButton("名称", field: .name, sort: sort, alignment: .leading, onSort: onSort)
-                .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(width: leadingColumnWidth, alignment: .leading)
             sortHeaderButton("大小", field: .size, sort: sort, alignment: .trailing, onSort: onSort)
-                .frame(width: 84, alignment: .trailing)
+                .frame(width: FileColumnMetrics.sizeWidth, alignment: .trailing)
             sortHeaderButton("日期", field: .date, sort: sort, alignment: .trailing, onSort: onSort)
-                .frame(width: 130, alignment: .trailing)
+                .frame(width: FileColumnMetrics.dateWidth, alignment: .trailing)
+            Spacer(minLength: 0)
         }
         .font(.caption)
         .foregroundStyle(.secondary)
@@ -1337,14 +1390,17 @@ private struct LocalEntryRow: View {
             Image(systemName: entry.isDirectory ? "folder.fill" : "doc")
                 .foregroundStyle(entry.isDirectory ? .blue : .secondary)
                 .frame(width: 20)
-            Text(entry.name).lineLimit(1)
-            Spacer()
+            Text(entry.name)
+                .lineLimit(1)
+                .frame(width: FileColumnMetrics.localNameWidth, alignment: .leading)
+                .help(entry.name)
             Text(entry.isDirectory ? "—" : ByteCountFormatter.string(fromByteCount: entry.size, countStyle: .file))
                 .foregroundStyle(.secondary)
-                .frame(width: 84, alignment: .trailing)
+                .frame(width: FileColumnMetrics.sizeWidth, alignment: .trailing)
             Text(entry.modifiedAt?.formatted(date: .numeric, time: .shortened) ?? "—")
                 .foregroundStyle(.secondary)
-                .frame(width: 130, alignment: .trailing)
+                .frame(width: FileColumnMetrics.dateWidth, alignment: .trailing)
+            Spacer(minLength: 0)
         }
         .font(.callout)
         .padding(.vertical, 2)
@@ -1360,14 +1416,17 @@ private struct RemoteEntryRow: View {
     var body: some View {
         HStack(spacing: 8) {
             thumbnailView
-            Text(entry.name).lineLimit(1)
-            Spacer()
+            Text(entry.name)
+                .lineLimit(1)
+                .frame(width: FileColumnMetrics.remoteNameWidth, alignment: .leading)
+                .help(entry.name)
             Text(entry.isDirectory ? "—" : ByteCountFormatter.string(fromByteCount: entry.size, countStyle: .file))
                 .foregroundStyle(.secondary)
-                .frame(width: 84, alignment: .trailing)
+                .frame(width: FileColumnMetrics.sizeWidth, alignment: .trailing)
             Text(entry.modifiedAt?.formatted(date: .numeric, time: .shortened) ?? "—")
                 .foregroundStyle(.secondary)
-                .frame(width: 130, alignment: .trailing)
+                .frame(width: FileColumnMetrics.dateWidth, alignment: .trailing)
+            Spacer(minLength: 0)
         }
         .font(.callout)
         .padding(.vertical, 4)

@@ -15,7 +15,13 @@ cd "$PROJECT_DIR"
 "$PROJECT_DIR/scripts/generate_icon.sh"
 
 if [[ -d "/Applications/Xcode.app" ]]; then
-  swift build -c release
+  CLANG_MODULE_CACHE_PATH="$LOCAL_BUILD_DIR/clang-cache" \
+  SWIFTPM_MODULECACHE_OVERRIDE="$LOCAL_BUILD_DIR/swift-cache" \
+  swift build \
+    --disable-sandbox \
+    --scratch-path "$LOCAL_BUILD_DIR" \
+    --cache-path "$LOCAL_CACHE_DIR" \
+    -c release
 elif [[ -d "$SDK_PATH" ]]; then
   CLANG_MODULE_CACHE_PATH="$LOCAL_BUILD_DIR/clang-cache" \
   SWIFTPM_MODULECACHE_OVERRIDE="$LOCAL_BUILD_DIR/swift-cache" \
