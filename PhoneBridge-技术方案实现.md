@@ -1,6 +1,6 @@
 # PhoneBridge 技术方案与实现说明
 
-> 适用版本：PhoneBridge 0.16.1（Build 38）
+> 适用版本：PhoneBridge 0.16.2（Build 39）
 > 文档定位：架构设计、关键实现、构建发布、验证现状和后续演进
 > 目标平台：Apple Silicon macOS 13+
 
@@ -940,7 +940,9 @@ DMG 包含：
 
 ### 20.6 GitHub Release 更新检查
 
-`AppUpdateChecker` 请求 GitHub REST API `GET /repos/Miraitwo/PhoneBridge/releases/latest`，仅接受非 draft、非 prerelease 且 `html_url` 为 `https://github.com` 的响应。`ReleaseVersion` 去除 `v` 前缀、预发布和构建后缀后逐段比较数字，避免字符串比较将 `1.10` 错判为小于 `1.9`。
+`AppUpdateChecker` 使用不下载页面正文的 HTTPS `HEAD` 请求访问 GitHub 官方地址 `https://github.com/Miraitwo/PhoneBridge/releases/latest`。`URLSession` 自动跟随 GitHub 的重定向，服务只接受最终地址为 `https://github.com/Miraitwo/PhoneBridge/releases/tag/<版本>` 的结果，再从标签解析版本号。整个过程不调用 `api.github.com`，因此不消耗 GitHub 匿名 REST API 配额；错误主机、错误仓库、未跳转地址和非数字版本标签都会被拒绝。
+
+`ReleaseVersion` 去除 `v` 前缀、预发布和构建后缀后逐段比较数字，避免字符串比较将 `1.10` 错判为小于 `1.9`。GitHub 的 `releases/latest` 只指向最新正式 Release；更新弹窗展示版本号并打开最终 Release 页面，发布时间和完整更新说明由该页面承载，不再依赖 API JSON。
 
 自动检查只在首次启动引导关闭后进行，成功后通过 `PhoneBridge.lastSuccessfulUpdateCheck` 做 24 小时限频；网络失败保持静默，不阻塞设备发现和主界面。手动检查复用同一服务，但会明确显示“已是最新版本”或失败原因。发现新版本后只打开 GitHub Release 网页，不自动下载、覆盖或执行安装包。
 
@@ -967,7 +969,7 @@ TeamIdentifier=not set
 - USB 传输发生在手机与 Mac 之间。
 - 无线传输发生在手机浏览器与 Mac 本地 HTTP 服务之间。
 - 应用不包含云端服务，不主动上传文件到互联网。
-- 更新检查只向 `api.github.com` 请求公开 Release 元数据，不上传手机文件、路径或设备信息。
+- 更新检查只向 `github.com/Miraitwo/PhoneBridge/releases/latest` 发送不含页面正文的 `HEAD` 请求，不调用 GitHub API，也不上传手机文件、路径或设备信息。
 
 ### 21.2 文件安全
 
@@ -991,10 +993,11 @@ Charles CA 可以解密受信任设备上的 HTTPS 流量。PhoneBridge 只提�
 
 ### 22.1 已完成验证
 
-- PhoneBridge 0.15.9 Release 编译通过，无 Swift 编译警告。
+- PhoneBridge 0.16.2（Build 39）完成 32 项 Swift 测试，0 失败，并通过 Release 编译与 `git diff --check`。
+- 真实访问 GitHub 官方 `releases/latest` 已验证：`HEAD` 请求返回 HTTP 200、正文下载量为 0，最终地址正确跳转到当前正式版本 `v0.16.1`，且未调用 `api.github.com`。
 - 主程序为 arm64 Mach-O。
 - DMG 创建、CRC 校验和只读挂载通过。
-- 当前源码、已校验 DMG 和 `/Applications/PhoneBridge.app` 均为 0.15.9，Build 36；本地 App 已安装并启动，GitHub 流水线发布待后续推送。
+- 当前源码为 0.16.2（Build 39）；对应 DMG 与 GitHub Release 将由下一次 `main` 推送触发流水线生成。
 - DMG 内 App 深度签名校验通过。
 - UxPlay、GStreamer、scrcpy、ADB 已封装。
 - 官方 UxPlay v1.73.6 已通过本机构建和包内版本检查；DMG CRC、深度签名与动态库路径检查通过。

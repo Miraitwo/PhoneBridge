@@ -63,54 +63,57 @@ final class AppUpdateCheckerTests: XCTestCase {
         ))
     }
 
-    func testDecodesGitHubLatestReleasePayload() throws {
-        let payload = #"""
-        {
-          "tag_name": "v0.16.2",
-          "name": "PhoneBridge 0.16.2",
-          "body": "Fixes and improvements",
-          "html_url": "https://github.com/Miraitwo/PhoneBridge/releases/tag/v0.16.2",
-          "published_at": "2026-09-11T04:00:00Z",
-          "draft": false,
-          "prerelease": false
-        }
-        """#
-        let decoder = JSONDecoder()
-        decoder.dateDecodingStrategy = .iso8601
-
-        let release = try decoder.decode(GitHubReleaseResponse.self, from: Data(payload.utf8))
+    func testParsesOfficialGitHubLatestReleaseRedirect() throws {
+        let redirectedURL = try XCTUnwrap(URL(
+            string: "https://github.com/Miraitwo/PhoneBridge/releases/tag/v0.16.2?source=latest#notes"
+        ))
+        let release = try XCTUnwrap(GitHubReleaseLocation(
+            redirectedURL: redirectedURL,
+            repository: "Miraitwo/PhoneBridge"
+        ))
 
         XCTAssertEqual(release.tagName, "v0.16.2")
-        XCTAssertEqual(release.name, "PhoneBridge 0.16.2")
-        XCTAssertEqual(release.htmlURL.host, "github.com")
-        XCTAssertNotNil(release.publishedAt)
-        XCTAssertFalse(release.draft)
-        XCTAssertFalse(release.prerelease)
+        XCTAssertEqual(
+            release.releaseURL.absoluteString,
+            "https://github.com/Miraitwo/PhoneBridge/releases/tag/v0.16.2"
+        )
+    }
+
+    func testRejectsUnexpectedGitHubReleaseRedirects() {
+        XCTAssertNil(GitHubReleaseLocation(
+            redirectedURL: URL(string: "https://example.com/Miraitwo/PhoneBridge/releases/tag/v0.16.2")!,
+            repository: "Miraitwo/PhoneBridge"
+        ))
+        XCTAssertNil(GitHubReleaseLocation(
+            redirectedURL: URL(string: "https://github.com/another/PhoneBridge/releases/tag/v0.16.2")!,
+            repository: "Miraitwo/PhoneBridge"
+        ))
+        XCTAssertNil(GitHubReleaseLocation(
+            redirectedURL: URL(string: "https://github.com/Miraitwo/PhoneBridge/releases/latest")!,
+            repository: "Miraitwo/PhoneBridge"
+        ))
     }
 
     @MainActor
     func testManualCheckPublishesNewerGitHubRelease() async throws {
-        let payload = #"""
-        {
-          "tag_name": "v0.16.2",
-          "name": "PhoneBridge 0.16.2",
-          "body": "Fixes and improvements",
-          "html_url": "https://github.com/Miraitwo/PhoneBridge/releases/tag/v0.16.2",
-          "published_at": "2026-09-11T04:00:00Z",
-          "draft": false,
-          "prerelease": false
-        }
-        """#
         MockURLProtocol.handler = { request in
-            XCTAssertEqual(request.url?.host, "api.github.com")
+            XCTAssertEqual(
+                request.url?.absoluteString,
+                "https://github.com/Miraitwo/PhoneBridge/releases/latest"
+            )
+            XCTAssertEqual(request.httpMethod, "HEAD")
             XCTAssertEqual(request.value(forHTTPHeaderField: "User-Agent"), "PhoneBridge/0.16.1")
+            XCTAssertEqual(
+                request.value(forHTTPHeaderField: "Accept"),
+                "text/html,application/xhtml+xml"
+            )
             let response = HTTPURLResponse(
-                url: request.url!,
+                url: URL(string: "https://github.com/Miraitwo/PhoneBridge/releases/tag/v0.16.2")!,
                 statusCode: 200,
                 httpVersion: "HTTP/1.1",
-                headerFields: ["Content-Type": "application/json"]
+                headerFields: ["Content-Type": "text/html"]
             )!
-            return (response, Data(payload.utf8))
+            return (response, Data())
         }
 
         let configuration = URLSessionConfiguration.ephemeral
@@ -131,7 +134,10 @@ final class AppUpdateCheckerTests: XCTestCase {
 
         XCTAssertEqual(checker.availableUpdate?.version, "0.16.2")
         XCTAssertEqual(checker.availableUpdate?.currentVersion, "0.16.1")
-        XCTAssertEqual(checker.availableUpdate?.releaseNotes, "Fixes and improvements")
+        XCTAssertEqual(
+            checker.availableUpdate?.releaseURL.absoluteString,
+            "https://github.com/Miraitwo/PhoneBridge/releases/tag/v0.16.2"
+        )
         XCTAssertNil(checker.notice)
         XCTAssertEqual(
             defaults.object(forKey: "PhoneBridge.lastSuccessfulUpdateCheck") as? Date,

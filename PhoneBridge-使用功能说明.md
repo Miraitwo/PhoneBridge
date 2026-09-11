@@ -1,6 +1,6 @@
 # PhoneBridge 使用与功能说明
 
-> 适用版本：PhoneBridge 0.16.1（Build 38）
+> 适用版本：PhoneBridge 0.16.2（Build 39）
 > 适用设备：Apple Silicon Mac、Android 手机、iPhone / iPad
 > 文档定位：面向安装、使用、演示和问题排查
 
@@ -19,7 +19,7 @@ PhoneBridge 是一款运行在 macOS 上的个人文件传输与手机投屏工�
 - 使用 scrcpy 独立窗口投屏 Android，或使用 UxPlay/AirPlay 以内嵌/独立窗口显示 iPhone 画面。
 - 同时连接多台 Android/iPhone；Android 可并行投屏，iPhone 同一时间只保留一个 AirPlay 接收器。
 
-PhoneBridge 0.16.1 的主界面由以下区域组成：
+PhoneBridge 0.16.2 的主界面由以下区域组成：
 
 1. 左侧：Mac 文件区。
 2. 中间：一台或多台手机文件面板。
@@ -78,7 +78,7 @@ iPhone 投屏需要以下任一条件：
 
 ### 3.1 安装
 
-1. 双击 `PhoneBridge-0.16.1-AppleSilicon.dmg`。
+1. 双击 `PhoneBridge-0.16.2-AppleSilicon.dmg`。
 2. 将 `PhoneBridge` 拖到“应用程序”文件夹。
 3. 从“应用程序”文件夹启动 PhoneBridge。
 
@@ -125,12 +125,13 @@ PhoneBridge 只负责打开对应设置页，不会自动修改系统网络配�
 
 ### 3.6 检查更新
 
-PhoneBridge 启动后会读取 `Miraitwo/PhoneBridge` 的 GitHub 最新正式 Release，成功检查后 24 小时内不会重复请求。当 Release 版本高于当前 App 版本时，会显示新版本号、发布时间和更新说明。
+PhoneBridge 启动后会访问 `https://github.com/Miraitwo/PhoneBridge/releases/latest`，跟随 GitHub 官方跳转并从最终 Release 标签地址读取版本。该方式不调用 GitHub API，也不消耗匿名 API 配额；成功检查后 24 小时内不会重复请求。
 
 - 点击“打开 GitHub Release”进入官方下载页。
 - 点击“稍后”只关闭提示，不下载或安装任何内容。
 - 也可在 macOS 菜单栏选择“帮助 → 检查更新…”立即检查。
-- 自动检查失败时不会干扰启动；手动检查会显示无网络、GitHub 限流或暂无 Release 等原因。
+- 自动检查失败时不会干扰启动；手动检查会显示无网络、代理阻断或暂无 Release 等原因。
+- 更新提示显示最新版本号；完整发布时间和更新说明可在 GitHub Release 页面查看。
 
 ## 4. 主界面说明
 

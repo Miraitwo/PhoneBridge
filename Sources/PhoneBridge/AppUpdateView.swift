@@ -17,18 +17,13 @@ struct AppUpdateView: View {
                         .font(.title2.bold())
                     Text("当前 \(update.currentVersion)  →  最新 \(update.version)")
                         .foregroundStyle(.secondary)
-                    if let publishedAt = update.publishedAt {
-                        Text("发布于 \(publishedAt.formatted(date: .abbreviated, time: .omitted))")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
                 }
                 Spacer()
             }
 
             GroupBox("\(update.title) · 更新说明") {
                 ScrollView {
-                    Text(update.releaseNotes.isEmpty ? "该版本未填写更新说明。" : update.releaseNotes)
+                    Text("完整更新说明请在 GitHub Release 页面查看。")
                         .textSelection(.enabled)
                         .frame(maxWidth: .infinity, alignment: .leading)
                         .padding(10)

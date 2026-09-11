@@ -54,23 +54,36 @@ enum AppUpdatePolicy {
     }
 }
 
-struct GitHubReleaseResponse: Decodable {
+struct GitHubReleaseLocation: Equatable {
     let tagName: String
-    let name: String?
-    let body: String?
-    let htmlURL: URL
-    let publishedAt: Date?
-    let draft: Bool
-    let prerelease: Bool
+    let releaseURL: URL
 
-    enum CodingKeys: String, CodingKey {
-        case tagName = "tag_name"
-        case name
-        case body
-        case htmlURL = "html_url"
-        case publishedAt = "published_at"
-        case draft
-        case prerelease
+    init?(redirectedURL: URL, repository: String) {
+        guard redirectedURL.scheme?.lowercased() == "https",
+              redirectedURL.host?.lowercased() == "github.com" else { return nil }
+
+        let repositoryParts = repository.split(separator: "/").map(String.init)
+        let pathParts = redirectedURL.path.split(separator: "/").map(String.init)
+        guard repositoryParts.count == 2,
+              pathParts.count == 5,
+              pathParts[0].caseInsensitiveCompare(repositoryParts[0]) == .orderedSame,
+              pathParts[1].caseInsensitiveCompare(repositoryParts[1]) == .orderedSame,
+              pathParts[2] == "releases",
+              pathParts[3] == "tag" else { return nil }
+
+        let tagName = pathParts[4].removingPercentEncoding ?? pathParts[4]
+        guard ReleaseVersion(tagName) != nil else { return nil }
+
+        var canonicalComponents = URLComponents(
+            url: redirectedURL,
+            resolvingAgainstBaseURL: false
+        )
+        canonicalComponents?.query = nil
+        canonicalComponents?.fragment = nil
+        guard let releaseURL = canonicalComponents?.url else { return nil }
+
+        self.tagName = tagName
+        self.releaseURL = releaseURL
     }
 }
 
@@ -78,9 +91,7 @@ struct AvailableAppUpdate: Identifiable {
     let currentVersion: String
     let version: String
     let title: String
-    let releaseNotes: String
     let releaseURL: URL
-    let publishedAt: Date?
 
     var id: String { version }
 }
@@ -102,7 +113,9 @@ private enum AppUpdateCheckError: LocalizedError {
         case .invalidResponse:
             return "GitHub 返回了无法识别的响应。"
         case .httpStatus(403):
-            return "GitHub 暂时限制了检查频率，请稍后再试。"
+            return "GitHub 拒绝了更新请求，请检查网络或代理后重试。"
+        case .httpStatus(429):
+            return "GitHub 暂时限制了访问频率，请稍后再试。"
         case .httpStatus(404):
             return "GitHub 仓库还没有可用的正式 Release。"
         case .httpStatus(let status):
@@ -117,8 +130,8 @@ private enum AppUpdateCheckError: LocalizedError {
 final class AppUpdateChecker: ObservableObject {
     static let repository = "Miraitwo/PhoneBridge"
     private static let lastSuccessfulCheckKey = "PhoneBridge.lastSuccessfulUpdateCheck"
-    private static let latestReleaseAPI = URL(
-        string: "https://api.github.com/repos/\(repository)/releases/latest"
+    private static let latestReleaseURL = URL(
+        string: "https://github.com/\(repository)/releases/latest"
     )!
 
     @Published private(set) var isChecking = false
@@ -177,29 +190,26 @@ final class AppUpdateChecker: ObservableObject {
 
         do {
             var request = URLRequest(
-                url: Self.latestReleaseAPI,
+                url: Self.latestReleaseURL,
                 cachePolicy: .reloadIgnoringLocalCacheData,
                 timeoutInterval: 15
             )
+            request.httpMethod = "HEAD"
             request.setValue("PhoneBridge/\(currentVersion)", forHTTPHeaderField: "User-Agent")
-            request.setValue("application/vnd.github+json", forHTTPHeaderField: "Accept")
-            request.setValue("2022-11-28", forHTTPHeaderField: "X-GitHub-Api-Version")
+            request.setValue("text/html,application/xhtml+xml", forHTTPHeaderField: "Accept")
 
-            let (data, response) = try await session.data(for: request)
+            let (_, response) = try await session.data(for: request)
             guard let httpResponse = response as? HTTPURLResponse else {
                 throw AppUpdateCheckError.invalidResponse
             }
-            guard httpResponse.statusCode == 200 else {
+            guard (200..<300).contains(httpResponse.statusCode) else {
                 throw AppUpdateCheckError.httpStatus(httpResponse.statusCode)
             }
-
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            let release = try decoder.decode(GitHubReleaseResponse.self, from: data)
-            guard !release.draft, !release.prerelease,
-                  release.htmlURL.scheme == "https",
-                  release.htmlURL.host?.lowercased() == "github.com",
-                  ReleaseVersion(release.tagName) != nil else {
+            guard let redirectedURL = httpResponse.url,
+                  let release = GitHubReleaseLocation(
+                    redirectedURL: redirectedURL,
+                    repository: Self.repository
+                  ) else {
                 throw AppUpdateCheckError.invalidRelease
             }
 
@@ -212,16 +222,11 @@ final class AppUpdateChecker: ObservableObject {
                 let normalizedVersion = release.tagName.lowercased().hasPrefix("v")
                     ? String(release.tagName.dropFirst())
                     : release.tagName
-                let releaseTitle = release.name?.trimmingCharacters(in: .whitespacesAndNewlines)
-                let displayTitle = releaseTitle.flatMap { $0.isEmpty ? nil : $0 }
-                    ?? "PhoneBridge \(normalizedVersion)"
                 availableUpdate = AvailableAppUpdate(
                     currentVersion: currentVersion,
                     version: normalizedVersion,
-                    title: displayTitle,
-                    releaseNotes: release.body?.trimmingCharacters(in: .whitespacesAndNewlines) ?? "",
-                    releaseURL: release.htmlURL,
-                    publishedAt: release.publishedAt
+                    title: "PhoneBridge \(normalizedVersion)",
+                    releaseURL: release.releaseURL
                 )
             } else if interactive {
                 notice = UpdateCheckNotice(
