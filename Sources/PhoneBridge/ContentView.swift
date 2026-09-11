@@ -701,11 +701,12 @@ struct ContentView: View {
                     .buttonStyle(.bordered)
                     .disabled(!model.isCurrentIPhoneMirroring)
 
-                    Button("刷新画面") {
+                    Button("修复黑屏") {
                         model.restartIPhoneMirroring()
                     }
                     .buttonStyle(.bordered)
                     .disabled(!model.isCurrentIPhoneMirroring)
+                    .help("重建 AirPlay 接收器和视频解码器；iPhone 可能需要重新选择接收名称")
                 }
                 .controlSize(.small)
                 .padding(.horizontal, 12)

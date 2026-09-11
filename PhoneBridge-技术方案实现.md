@@ -1,6 +1,6 @@
 # PhoneBridge 技术方案与实现说明
 
-> 适用版本：PhoneBridge 0.15.9（Build 36）
+> 适用版本：PhoneBridge 0.16.1（Build 38）
 > 文档定位：架构设计、关键实现、构建发布、验证现状和后续演进
 > 目标平台：Apple Silicon macOS 13+
 
@@ -784,7 +784,19 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 - 投屏运行中改名时，先停止当前 UxPlay，再以新 `-n` 参数自动启动；iPhone 需要重新选择接收器。
 - 投屏侧栏直接显示当前会话最终生效的名称，便于多人、多设备环境现场核对。
 
-### 16.9 投屏截屏与录屏
+### 16.9 公司网络模式与首次启动引导
+
+公司网络模式不尝试绕过企业网络策略，也不自动开启 macOS 互联网共享。`WirelessConnectionView` 复用 `CompanyNetworkModeGuideView`，只向用户解释“有线/USB 网卡作为上游、Mac Wi-Fi 作为独立热点、iPhone 接入热点后使用普通 AirPlay”的端到端路径，并通过 `x-apple.systempreferences:com.apple.Sharing-Settings.extension` 打开系统共享设置。这样不会触碰管理员权限、MDM 或现有 Android USB 会话。
+
+首次启动引导由 `FirstLaunchGuideState` 使用 `PhoneBridge.firstLaunchGuideShown.v1` 记录是否已经展示。应用第一次判断需要展示时立即写入标记，保证即使用户直接退出，引导也不会在以后每次启动重复出现；“帮助”菜单仍可手动打开。引导分为文件互传、连接手机、公司网络投屏、投屏与截录四页，并复用同一公司网络说明组件，避免两个入口的文案漂移。
+
+### 16.10 iPhone 特殊窗口黑屏兼容
+
+iPhone 打开 Debug 悬浮工具、新的 `UIWindow` 或特殊渲染层时，AirPlay 可能会在不断流的情况下切换 H.264 参考帧。GStreamer `decodebin` 在 macOS 上可能选中 VideoToolbox 硬件解码，异常时仍持续输出帧，但旧参考画面变黑，只保留新绘制的局部图标。
+
+PhoneBridge 0.16.1 在 UxPlay 参数中固定加入 `-avdec`，使用已随 App 封装的 `avdec_h264` 软件解码器，再经 `videoconvert -> videoscale -> jpegenc -> tcpclientsink` 传给内嵌帧接收器。这会增加少量 CPU 占用，但能避免硬件解码参考状态卡死，且不改变 Android scrcpy 和 AirPlay 网络连接逻辑。投屏侧栏保留“修复黑屏”按钮，用于在极端情况下完整重建 UxPlay 与解码管线。
+
+### 16.11 投屏截屏与录屏
 
 `MirrorCaptureService` 将投屏来源统一为 `MirrorCaptureSource`：
 
@@ -808,6 +820,7 @@ AirPlay -> GStreamer 解码 -> JPEG 编码 -> TCP -> ImageIO JPEG 解码 -> Swif
 | `PhoneBridge.iPhonePeerToPeerPIN` | 4 位附近投屏 PIN |
 | `PhoneBridge.iPhoneMirrorMode` | iPhone 投屏的内嵌 / 独立窗口偏好 |
 | `PhoneBridge.lastMirrorCaptureDirectory` | 上次投屏截图或录像的保存文件夹 |
+| `PhoneBridge.lastSuccessfulUpdateCheck` | 上次成功检查 GitHub Release 的时间 |
 
 设备面板顺序、搜索、筛选、排序和勾选状态当前不跨应用重启保存。
 
@@ -925,7 +938,13 @@ DMG 包含：
 
 流水线拥有最小 `contents: write` 权限，只用于创建标签、Release 和上传安装包。第三方源码/二进制版本在工作流中固定，scrcpy 下载后使用官方 `SHA256SUMS.txt` 校验。
 
-### 20.6 签名与公证
+### 20.6 GitHub Release 更新检查
+
+`AppUpdateChecker` 请求 GitHub REST API `GET /repos/Miraitwo/PhoneBridge/releases/latest`，仅接受非 draft、非 prerelease 且 `html_url` 为 `https://github.com` 的响应。`ReleaseVersion` 去除 `v` 前缀、预发布和构建后缀后逐段比较数字，避免字符串比较将 `1.10` 错判为小于 `1.9`。
+
+自动检查只在首次启动引导关闭后进行，成功后通过 `PhoneBridge.lastSuccessfulUpdateCheck` 做 24 小时限频；网络失败保持静默，不阻塞设备发现和主界面。手动检查复用同一服务，但会明确显示“已是最新版本”或失败原因。发现新版本后只打开 GitHub Release 网页，不自动下载、覆盖或执行安装包。
+
+### 20.7 签名与公证
 
 当前为 ad-hoc 临时签名：
 
@@ -948,6 +967,7 @@ TeamIdentifier=not set
 - USB 传输发生在手机与 Mac 之间。
 - 无线传输发生在手机浏览器与 Mac 本地 HTTP 服务之间。
 - 应用不包含云端服务，不主动上传文件到互联网。
+- 更新检查只向 `api.github.com` 请求公开 Release 元数据，不上传手机文件、路径或设备信息。
 
 ### 21.2 文件安全
 

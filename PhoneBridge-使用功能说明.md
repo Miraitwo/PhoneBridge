@@ -1,6 +1,6 @@
 # PhoneBridge 使用与功能说明
 
-> 适用版本：PhoneBridge 0.15.9（Build 36）
+> 适用版本：PhoneBridge 0.16.1（Build 38）
 > 适用设备：Apple Silicon Mac、Android 手机、iPhone / iPad
 > 文档定位：面向安装、使用、演示和问题排查
 
@@ -19,7 +19,7 @@ PhoneBridge 是一款运行在 macOS 上的个人文件传输与手机投屏工�
 - 使用 scrcpy 独立窗口投屏 Android，或使用 UxPlay/AirPlay 以内嵌/独立窗口显示 iPhone 画面。
 - 同时连接多台 Android/iPhone；Android 可并行投屏，iPhone 同一时间只保留一个 AirPlay 接收器。
 
-PhoneBridge 0.15.9 的主界面由以下区域组成：
+PhoneBridge 0.16.1 的主界面由以下区域组成：
 
 1. 左侧：Mac 文件区。
 2. 中间：一台或多台手机文件面板。
@@ -78,7 +78,7 @@ iPhone 投屏需要以下任一条件：
 
 ### 3.1 安装
 
-1. 双击 `PhoneBridge-0.15.9-AppleSilicon.dmg`。
+1. 双击 `PhoneBridge-0.16.1-AppleSilicon.dmg`。
 2. 将 `PhoneBridge` 拖到“应用程序”文件夹。
 3. 从“应用程序”文件夹启动 PhoneBridge。
 
@@ -104,6 +104,33 @@ iPhone 投屏需要以下任一条件：
 - 手机浏览器访问 PhoneBridge 无线传输页面。
 
 如果曾经拒绝，可在“系统设置 → 隐私与安全性 → 本地网络”中重新开启。
+
+### 3.4 首次启动引导
+
+首次启动 0.16.0 时，PhoneBridge 会自动显示一次新手引导，依次介绍文件互传、手机连接、公司网络无线投屏和投屏截录。引导一旦显示便会记录状态，后续启动不再自动弹出。
+
+需要重新查看时，可点击 macOS 菜单栏“帮助 → PhoneBridge 新手引导”。
+
+### 3.5 公司网络无线投屏
+
+公司 Wi-Fi 可能屏蔽 Bonjour/mDNS 或禁止终端互访。此时即使 Mac 和 iPhone 显示连接同一个 Wi-Fi，iPhone 也可能找不到 PhoneBridge。推荐使用应用“无线连接”顶部的“公司网络模式”：
+
+1. 让 Mac 通过有线网卡或 USB 网卡接入公司网络。
+2. 点击“打开互联网共享设置”。
+3. 在 macOS“通用 → 共享 → 互联网共享”中，把有线/USB 网络共享到 Wi-Fi，并设置热点名称和密码。
+4. 让 iPhone 连接 Mac 创建的热点。
+5. 在 PhoneBridge 中关闭“附近设备投屏”，启动普通 iPhone AirPlay 接收器。
+
+PhoneBridge 只负责打开对应设置页，不会自动修改系统网络配置。Android USB/有线调试完全不受影响；Android 无线 ADB 如果也切换到 Mac 热点，需要重新建立一次无线连接。如果公司 MDM 禁止互联网共享，请改用随身路由器或另一台手机热点。
+
+### 3.6 检查更新
+
+PhoneBridge 启动后会读取 `Miraitwo/PhoneBridge` 的 GitHub 最新正式 Release，成功检查后 24 小时内不会重复请求。当 Release 版本高于当前 App 版本时，会显示新版本号、发布时间和更新说明。
+
+- 点击“打开 GitHub Release”进入官方下载页。
+- 点击“稍后”只关闭提示，不下载或安装任何内容。
+- 也可在 macOS 菜单栏选择“帮助 → 检查更新…”立即检查。
+- 自动检查失败时不会干扰启动；手动检查会显示无网络、GitHub 限流或暂无 Release 等原因。
 
 ## 4. 主界面说明
 
@@ -503,6 +530,12 @@ Android 不再提供内嵌模式。若独立窗口断开，请检查 USB 调试�
 iPhone 的内嵌和独立窗口都直接使用 AirPlay 投屏帧，不额外申请屏幕录制权限。Android 独立窗口本身不需要 PhoneBridge 的屏幕录制权限；只有使用截屏和录屏时，PhoneBridge 才通过 ScreenCaptureKit 采集 scrcpy 窗口，需要在“系统设置 → 隐私与安全性 → 屏幕与系统录音”中获得授权。首次授权后需完全退出并重新打开应用。
 
 当前 iPhone 投屏只显示视频画面，不接收音频。
+
+### 14.6 Debug 悬浮工具黑屏
+
+0.16.1 起，iPhone AirPlay 默认使用稳定性更高的软件解码，用于避免打开 Debug 悬浮工具或切换特殊窗口后，画面只剩局部图标而背景持续变黑。
+
+如果仍遇到黑屏，点击投屏侧栏的“修复黑屏”重建 AirPlay 接收器和解码器；iPhone 可能需要在“屏幕镜像”中重新选择一次当前接收名称。
 
 ## 15. 多设备使用
 

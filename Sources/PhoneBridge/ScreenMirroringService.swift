@@ -7,6 +7,47 @@ struct AndroidMirrorLaunch {
     let windowTitle: String
 }
 
+enum IPhoneAirPlayLaunchArguments {
+    static func make(
+        receiverName: String,
+        deviceID: String,
+        streamPort: UInt16,
+        quality: IPhoneMirrorQuality,
+        peerToPeer: Bool,
+        pin: String?
+    ) -> [String] {
+        var arguments = [
+            "-n", receiverName,
+            "-nh",
+            "-m", deviceID,
+            "-d", "1",
+            "-as", "0",
+            "-vsync", "no",
+            "-s", quality.requestedResolution,
+            "-fps", String(quality.maximumFrameRate),
+
+            // AirPlay can change reference frames when an app presents a
+            // separate UIWindow (for example a debug floating tool). On some
+            // macOS/GStreamer combinations decodebin selects the VideoToolbox
+            // decoder, which may keep an invalid reference state and render a
+            // black background until the receiver is recreated. The bundled
+            // libav decoder is slower but recovers these stream changes
+            // reliably and is fast enough for the supported 1080p stream.
+            "-avdec",
+            "-vs", "jpegenc quality=\(quality.jpegQuality) ! tcpclientsink host=127.0.0.1 port=\(streamPort)"
+        ]
+
+        if peerToPeer {
+            arguments.append("-p2p")
+            arguments.append("-pin")
+            if let pin, pin.count == 4 {
+                arguments.append(pin)
+            }
+        }
+        return arguments
+    }
+}
+
 enum MirroringProcessLifecycle {
     static let uxPlayStreamEndedMarkers = [
         "video_reset: type = RTP_Shutdown",
@@ -177,7 +218,7 @@ final class ScreenMirroringService {
             return nil
         }
 
-        if streamPort == nil {
+        guard let streamPort else {
             onError?("投屏画面通道尚未准备好，请重新启动投屏。")
             return nil
         }
@@ -193,33 +234,18 @@ final class ScreenMirroringService {
             ? "PhoneBridge"
             : receiverName
         process.executableURL = executable
-        var arguments = [
-            "-n", normalizedReceiverName,
-            "-nh",
-            "-m", airPlayDeviceID,
-            "-d", "1",
-            "-as", "0",
-            "-vsync", "no",
-            "-s", quality.requestedResolution,
-            "-fps", String(quality.maximumFrameRate)
-        ]
-        if let streamPort {
-            // Both display modes use the stable JPEG/TCP path. PhoneBridge
-            // renders separate mode in its own native NSWindow; this avoids
-            // avsamplebufferlayersink, which crashes inside libgstapplemedia
-            // while processing real AirPlay frames on macOS 26.
-            arguments.append(contentsOf: [
-                "-vs", "jpegenc quality=\(quality.jpegQuality) ! tcpclientsink host=127.0.0.1 port=\(streamPort)"
-            ])
-        }
-        if peerToPeer {
-            arguments.append("-p2p")
-            arguments.append("-pin")
-            if let pin, pin.count == 4 {
-                arguments.append(pin)
-            }
-        }
-        process.arguments = arguments
+        // Both display modes use the stable JPEG/TCP path. PhoneBridge renders
+        // separate mode in its own native NSWindow; this avoids
+        // avsamplebufferlayersink, which crashes inside libgstapplemedia while
+        // processing real AirPlay frames on macOS 26.
+        process.arguments = IPhoneAirPlayLaunchArguments.make(
+            receiverName: normalizedReceiverName,
+            deviceID: airPlayDeviceID,
+            streamPort: streamPort,
+            quality: quality,
+            peerToPeer: peerToPeer,
+            pin: pin
+        )
 
         var environment = ProcessInfo.processInfo.environment
         configureBundledRuntimeEnvironment(&environment)

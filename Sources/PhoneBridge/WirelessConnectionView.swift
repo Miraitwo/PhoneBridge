@@ -10,6 +10,7 @@ struct WirelessConnectionView: View {
     @State private var connectionEndpoint = ""
     @State private var iPhoneReceiverName = ""
     @State private var isWorking = false
+    @State private var isCompanyNetworkGuideExpanded = false
     @State private var isManualAndroidPairingExpanded = false
 
     var body: some View {
@@ -31,6 +32,21 @@ struct WirelessConnectionView: View {
 
             ScrollView {
                 VStack(alignment: .leading, spacing: 18) {
+                    GroupBox("公司网络模式（推荐）") {
+                        VStack(alignment: .leading, spacing: 10) {
+                            Text("公司 Wi-Fi 搜不到接收器时，可让 Mac 通过有线/USB 网卡上网并创建独立热点；不会影响 Android USB。")
+                                .font(.callout)
+                                .foregroundStyle(.secondary)
+                                .fixedSize(horizontal: false, vertical: true)
+
+                            DisclosureGroup("查看热点设置步骤", isExpanded: $isCompanyNetworkGuideExpanded) {
+                                CompanyNetworkModeGuideView()
+                                    .padding(.top, 10)
+                            }
+                        }
+                        .padding(6)
+                    }
+
                     GroupBox("iPhone AirPlay 投屏（名称与启动）") {
                         VStack(alignment: .leading, spacing: 12) {
                             Text("无需先连接数据线。先在这里设置一个容易区分的名称，再直接启动接收器。")
